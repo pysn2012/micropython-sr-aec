@@ -70,6 +70,24 @@ static const esp_mn_iface_t *multinet = NULL;
 static esp_afe_sr_data_t *afe_data = NULL;
 static bool espsr_initialized = false;
 
+// AEC参考信号缓冲区 (用于播放打断)
+static int16_t *g_reference_buffer = NULL;
+static size_t g_reference_buffer_size = 0;
+static size_t g_reference_write_index = 0;
+static size_t g_reference_read_index = 0;
+static SemaphoreHandle_t g_reference_mutex = NULL;
+
+#define REFERENCE_BUFFER_SIZE (16000 * 2)  // 2秒缓冲 (16kHz采样率)
+
+// 录音数据缓冲区（供Python层读取，避免I2S冲突）
+static int16_t *g_record_buffer = NULL;
+static size_t g_record_buffer_size = 0;
+static size_t g_record_write_index = 0;
+static size_t g_record_read_index = 0;
+static SemaphoreHandle_t g_record_mutex = NULL;
+static bool g_recording_enabled = false;  // 录音使能标志
+#define RECORD_BUFFER_SIZE (16000 * 10)  // 10秒缓冲 (16kHz采样率)
+
 // 脉冲输出初始化和控制
 static void init_pulse_gpio(void) {
     gpio_config_t io_conf = {
@@ -157,7 +175,7 @@ static void init_i2s(void) {
     ESP_LOGI(TAG, "I2S initialized successfully (new API)");
 }
 
-// feed任务：不断采集I2S数据并喂给AFE (完全参照参考工程)
+// feed任务：构建双通道数据(麦克风+参考信号)并喂给AFE (支持AEC)
 void feed_Task(void *arg) {
     esp_afe_sr_data_t *afe_data = arg;
     int feed_chunksize = afe_handle->get_feed_chunksize(afe_data);
@@ -165,11 +183,73 @@ void feed_Task(void *arg) {
     int16_t *feed_buff = (int16_t *) malloc(feed_chunksize * feed_nch * sizeof(int16_t));
     
     assert(feed_buff);
+    ESP_LOGI(TAG, "Feed task started: chunksize=%d, channels=%d", feed_chunksize, feed_nch);
+    
     while (task_flag) {
         size_t bytesIn = 0;
-        esp_err_t result = i2s_channel_read(rx_handle, feed_buff, feed_chunksize * feed_nch * sizeof(int16_t), &bytesIn, portMAX_DELAY);
-        afe_handle->feed(afe_data, feed_buff);
+        
+        // 分配临时缓冲区存储PDM麦克风数据
+        int16_t *mic_data = (int16_t *) malloc(feed_chunksize * sizeof(int16_t));
+        if (mic_data == NULL) {
+            ESP_LOGE(TAG, "Failed to allocate mic_data buffer");
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        
+        // 从PDM麦克风读取数据
+        esp_err_t result = i2s_channel_read(rx_handle, mic_data, 
+            feed_chunksize * sizeof(int16_t), &bytesIn, portMAX_DELAY);
+        
+        if (result == ESP_OK && bytesIn > 0) {
+            // 构建双通道数据：交错排列麦克风和参考信号
+            if (g_reference_mutex != NULL && 
+                xSemaphoreTake(g_reference_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                
+                for (int i = 0; i < feed_chunksize; i++) {
+                    feed_buff[i * 2] = mic_data[i];  // 通道0：麦克风数据
+                    
+                    // 通道1：参考信号（播放音频）
+                    if (g_reference_buffer != NULL && g_reference_buffer_size > 0) {
+                        feed_buff[i * 2 + 1] = g_reference_buffer[g_reference_read_index];
+                        g_reference_read_index = (g_reference_read_index + 1) % g_reference_buffer_size;
+                    } else {
+                        feed_buff[i * 2 + 1] = 0;  // 没有参考信号，填充0
+                    }
+                }
+                xSemaphoreGive(g_reference_mutex);
+            } else {
+                // 如果无法获取锁，只使用麦克风数据
+                for (int i = 0; i < feed_chunksize; i++) {
+                    feed_buff[i * 2] = mic_data[i];
+                    feed_buff[i * 2 + 1] = 0;
+                }
+            }
+            
+            // 如果录音已启用，将麦克风数据写入录音缓冲区
+            if (g_recording_enabled && g_record_mutex != NULL && 
+                xSemaphoreTake(g_record_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                
+                if (g_record_buffer != NULL && g_record_buffer_size > 0) {
+                    for (int i = 0; i < feed_chunksize; i++) {
+                        g_record_buffer[g_record_write_index] = mic_data[i];
+                        g_record_write_index = (g_record_write_index + 1) % g_record_buffer_size;
+                        
+                        // 如果写指针追上读指针，说明缓冲区满了，覆盖最旧的数据
+                        if (g_record_write_index == g_record_read_index) {
+                            g_record_read_index = (g_record_read_index + 1) % g_record_buffer_size;
+                        }
+                    }
+                }
+                xSemaphoreGive(g_record_mutex);
+            }
+            
+            // 喂给AFE进行AEC处理
+            afe_handle->feed(afe_data, feed_buff);
+        }
+        
+        free(mic_data);
     }
+    
     if (feed_buff) {
         free(feed_buff);
         feed_buff = NULL;
@@ -247,7 +327,7 @@ static mp_obj_t espsr_init(void) {
         return mp_const_true;
     }
     
-    ESP_LOGI(TAG, "Initializing ESP-SR...");
+    ESP_LOGI(TAG, "Initializing ESP-SR with AEC...");
     
     // 初始化GPIO脉冲输出
     init_pulse_gpio();
@@ -255,15 +335,75 @@ static mp_obj_t espsr_init(void) {
     // 初始化I2S
     init_i2s();
     
-    // 初始化语音识别模型 (跳过WakeNet，只使用MultiNet)
-    srmodel_list_t *models = esp_srmodel_init("model");
-    afe_config_t *afe_config = afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
+    // 初始化参考信号缓冲区 (用于AEC)
+    g_reference_buffer = (int16_t *) heap_caps_malloc(
+        REFERENCE_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (g_reference_buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate reference buffer");
+        return mp_const_false;
+    }
+    g_reference_buffer_size = REFERENCE_BUFFER_SIZE;
+    g_reference_write_index = 0;
+    g_reference_read_index = 0;
+    memset(g_reference_buffer, 0, REFERENCE_BUFFER_SIZE * sizeof(int16_t));
+    ESP_LOGI(TAG, "Reference buffer allocated: %d samples", REFERENCE_BUFFER_SIZE);
     
-    // 跳过WakeNet配置，只使用AFE进行音频预处理
+    g_reference_mutex = xSemaphoreCreateMutex();
+    if (g_reference_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create reference mutex");
+        heap_caps_free(g_reference_buffer);
+        g_reference_buffer = NULL;
+        return mp_const_false;
+    }
+    
+    // 初始化录音数据缓冲区
+    g_record_buffer = (int16_t *) heap_caps_malloc(
+        RECORD_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (g_record_buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate record buffer");
+        heap_caps_free(g_reference_buffer);
+        vSemaphoreDelete(g_reference_mutex);
+        g_reference_buffer = NULL;
+        g_reference_mutex = NULL;
+        return mp_const_false;
+    }
+    g_record_buffer_size = RECORD_BUFFER_SIZE;
+    g_record_write_index = 0;
+    g_record_read_index = 0;
+    g_recording_enabled = false;  // 默认关闭录音
+    memset(g_record_buffer, 0, RECORD_BUFFER_SIZE * sizeof(int16_t));
+    ESP_LOGI(TAG, "Record buffer allocated: %d samples (%.1f seconds)", 
+        RECORD_BUFFER_SIZE, (float)RECORD_BUFFER_SIZE / 16000.0);
+    
+    g_record_mutex = xSemaphoreCreateMutex();
+    if (g_record_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create record mutex");
+        heap_caps_free(g_record_buffer);
+        heap_caps_free(g_reference_buffer);
+        vSemaphoreDelete(g_reference_mutex);
+        g_record_buffer = NULL;
+        g_reference_buffer = NULL;
+        g_reference_mutex = NULL;
+        return mp_const_false;
+    }
+    
+    // 初始化语音识别模型 (使用MR格式支持AEC)
+    srmodel_list_t *models = esp_srmodel_init("model");
+    // MR格式：M=麦克风，R=参考信号(播放音频)
+    afe_config_t *afe_config = afe_config_init("MR", models, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
+    
+    // 启用AEC配置
     afe_config->wakenet_model_name = NULL;  // 不加载唤醒词模型
-    afe_config->aec_init = false;
+    afe_config->aec_init = true;  // 启用AEC
+    afe_config->aec_mode = AEC_MODE_SR_HIGH_PERF;  // 使用SR高性能模式
+    ESP_LOGI(TAG, "AFE config: format=MR, aec_init=true, aec_mode=%d", afe_config->aec_mode);
+    
     afe_handle = esp_afe_handle_from_config(afe_config);
     afe_data = afe_handle->create_from_config(afe_config);
+    
+    // 验证通道数
+    int feed_channels = afe_handle->get_feed_channel_num(afe_data);
+    ESP_LOGI(TAG, "AFE feed channels: %d (expected: 2 for MR)", feed_channels);
     
     // 初始化MultiNet
     char *mn_name = esp_srmodel_filter(models, ESP_MN_CHINESE, NULL);
@@ -286,8 +426,8 @@ static mp_obj_t espsr_init(void) {
     
     afe_config_free(afe_config);
     
-    // 创建结果队列
-    g_result_que = xQueueCreate(1, sizeof(sr_result_t));
+    // 创建结果队列 (增大到10，避免结果丢失)
+    g_result_que = xQueueCreate(10, sizeof(sr_result_t));
     
     // 启动任务
     task_flag = 1;
@@ -340,6 +480,121 @@ static mp_obj_t espsr_get_commands(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(espsr_get_commands_obj, espsr_get_commands);
 
+// MicroPython接口：输入参考信号 (播放音频数据用于AEC)
+static mp_obj_t espsr_feed_reference(mp_obj_t data_obj) {
+    if (!espsr_initialized) {
+        return mp_const_false;
+    }
+    
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(data_obj, &bufinfo, MP_BUFFER_READ);
+    
+    if (g_reference_buffer == NULL || g_reference_mutex == NULL) {
+        ESP_LOGW(TAG, "Reference buffer not initialized");
+        return mp_const_false;
+    }
+    
+    // 将播放数据写入参考缓冲区
+    int16_t *data = (int16_t *)bufinfo.buf;
+    int samples = bufinfo.len / 2;
+    
+    if (xSemaphoreTake(g_reference_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        for (int i = 0; i < samples; i++) {
+            g_reference_buffer[g_reference_write_index] = data[i];
+            g_reference_write_index = (g_reference_write_index + 1) % g_reference_buffer_size;
+        }
+        xSemaphoreGive(g_reference_mutex);
+        return mp_const_true;
+    }
+    
+    ESP_LOGW(TAG, "Failed to acquire reference mutex");
+    return mp_const_false;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(espsr_feed_reference_obj, espsr_feed_reference);
+
+// MicroPython接口：启用录音模式
+static mp_obj_t espsr_start_recording(void) {
+    if (!espsr_initialized) {
+        ESP_LOGW(TAG, "ESP-SR not initialized");
+        return mp_const_false;
+    }
+    
+    if (g_record_buffer == NULL || g_record_mutex == NULL) {
+        ESP_LOGW(TAG, "Record buffer not initialized");
+        return mp_const_false;
+    }
+    
+    // 清空录音缓冲区
+    if (xSemaphoreTake(g_record_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        g_record_write_index = 0;
+        g_record_read_index = 0;
+        memset(g_record_buffer, 0, g_record_buffer_size * sizeof(int16_t));
+        g_recording_enabled = true;
+        xSemaphoreGive(g_record_mutex);
+        ESP_LOGI(TAG, "Recording started");
+        return mp_const_true;
+    }
+    
+    ESP_LOGW(TAG, "Failed to acquire record mutex");
+    return mp_const_false;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(espsr_start_recording_obj, espsr_start_recording);
+
+// MicroPython接口：停止录音模式
+static mp_obj_t espsr_stop_recording(void) {
+    if (!espsr_initialized) {
+        return mp_const_false;
+    }
+    
+    g_recording_enabled = false;
+    ESP_LOGI(TAG, "Recording stopped");
+    return mp_const_true;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(espsr_stop_recording_obj, espsr_stop_recording);
+
+// MicroPython接口：读取录音数据
+// 用法: bytes_read = espsr.read_audio(buffer)
+// 返回实际读取的字节数
+static mp_obj_t espsr_read_audio(mp_obj_t buffer_obj) {
+    if (!espsr_initialized || !g_recording_enabled) {
+        return mp_obj_new_int(0);
+    }
+    
+    if (g_record_buffer == NULL || g_record_mutex == NULL) {
+        return mp_obj_new_int(0);
+    }
+    
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(buffer_obj, &bufinfo, MP_BUFFER_WRITE);
+    
+    int16_t *dest = (int16_t *)bufinfo.buf;
+    int max_samples = bufinfo.len / 2;  // 16位样本
+    int bytes_read = 0;
+    
+    if (xSemaphoreTake(g_record_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        // 计算可读取的样本数
+        int available_samples;
+        if (g_record_write_index >= g_record_read_index) {
+            available_samples = g_record_write_index - g_record_read_index;
+        } else {
+            available_samples = g_record_buffer_size - g_record_read_index + g_record_write_index;
+        }
+        
+        // 读取数据
+        int samples_to_read = (available_samples < max_samples) ? available_samples : max_samples;
+        for (int i = 0; i < samples_to_read; i++) {
+            dest[i] = g_record_buffer[g_record_read_index];
+            g_record_read_index = (g_record_read_index + 1) % g_record_buffer_size;
+        }
+        
+        bytes_read = samples_to_read * 2;  // 转换为字节数
+        xSemaphoreGive(g_record_mutex);
+    }
+    
+    return mp_obj_new_int(bytes_read);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(espsr_read_audio_obj, espsr_read_audio);
+
 // MicroPython接口：清理资源
 static mp_obj_t espsr_cleanup(void) {
     if (!espsr_initialized) {
@@ -375,8 +630,39 @@ static mp_obj_t espsr_cleanup(void) {
         g_result_que = NULL;
     }
     
+    // 清理参考信号缓冲区
+    if (g_reference_buffer) {
+        heap_caps_free(g_reference_buffer);
+        g_reference_buffer = NULL;
+        g_reference_buffer_size = 0;
+        g_reference_write_index = 0;
+        g_reference_read_index = 0;
+        ESP_LOGI(TAG, "Reference buffer freed");
+    }
+    
+    if (g_reference_mutex) {
+        vSemaphoreDelete(g_reference_mutex);
+        g_reference_mutex = NULL;
+    }
+    
+    // 清理录音数据缓冲区
+    if (g_record_buffer) {
+        heap_caps_free(g_record_buffer);
+        g_record_buffer = NULL;
+        g_record_buffer_size = 0;
+        g_record_write_index = 0;
+        g_record_read_index = 0;
+        g_recording_enabled = false;
+        ESP_LOGI(TAG, "Record buffer freed");
+    }
+    
+    if (g_record_mutex) {
+        vSemaphoreDelete(g_record_mutex);
+        g_record_mutex = NULL;
+    }
+    
     espsr_initialized = false;
-    ESP_LOGI(TAG, "ESP-SR cleaned up");
+    ESP_LOGI(TAG, "ESP-SR cleaned up (with AEC support)");
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(espsr_cleanup_obj, espsr_cleanup);
@@ -388,6 +674,10 @@ static const mp_rom_map_elem_t espsr_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_listen), MP_ROM_PTR(&espsr_listen_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_commands), MP_ROM_PTR(&espsr_get_commands_obj) },
     { MP_ROM_QSTR(MP_QSTR_cleanup), MP_ROM_PTR(&espsr_cleanup_obj) },
+    { MP_ROM_QSTR(MP_QSTR_feed_reference), MP_ROM_PTR(&espsr_feed_reference_obj) },
+    { MP_ROM_QSTR(MP_QSTR_start_recording), MP_ROM_PTR(&espsr_start_recording_obj) },
+    { MP_ROM_QSTR(MP_QSTR_stop_recording), MP_ROM_PTR(&espsr_stop_recording_obj) },
+    { MP_ROM_QSTR(MP_QSTR_read_audio), MP_ROM_PTR(&espsr_read_audio_obj) },
 };
 
 static MP_DEFINE_CONST_DICT(espsr_module_globals, espsr_module_globals_table);

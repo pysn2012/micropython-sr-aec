@@ -48,7 +48,7 @@ class SensorSystem:
         I2S_WS_PIN = 16
         I2S_SD_PIN = 7
 
-        # 初始化I2S
+        # 初始化I2S - 增大缓冲区以提高播放流畅度
         self.audio_out = I2S(
             1,
             sck=Pin(I2S_BCK_PIN),
@@ -58,7 +58,7 @@ class SensorSystem:
             bits=16,
             format=I2S.MONO,
             rate=16000,  # 根据你的WAV文件采样率调整
-            ibuf=2048    # 缓冲区大小
+            ibuf=8192    # 增大缓冲区到8KB，减少卡顿
         )
 
         self.is_init_record_mic = False
@@ -238,31 +238,54 @@ class SensorSystem:
             gc.collect()
             self.should_stop = False
 
-    def apply_volume_reduction(self, audio_data, factor):
-        """降低音频音量以减少对麦克风的干扰"""
+    def apply_volume_reduction_fast(self, audio_data, factor):
+        """快速音量调整 - 使用位移运算，极速版本"""
         if len(audio_data) % 2 != 0:
-            return  # 确保是16位音频数据
-            
-        # 将字节数据转换为16位整数数组
-        samples = array.array('h')
-        for i in range(0, len(audio_data), 2):
-            sample = struct.unpack('<h', audio_data[i:i+2])[0]
-            # 应用音量降低
-            reduced_sample = int(sample * factor)
-            # 防止溢出
-            if reduced_sample > 32767:
-                reduced_sample = 32767
-            elif reduced_sample < -32768:
-                reduced_sample = -32768
-            samples.append(reduced_sample)
+            return
         
-        # 将处理后的数据写回原数组 - 使用struct.pack代替to_bytes
-        for i, sample in enumerate(samples):
-            audio_data[i*2:i*2+2] = struct.pack('<h', sample)
+        # factor=1.0表示不调整音量，直接返回（最快）
+        if factor >= 1.0:
+            return
+        
+        # 计算位移量：
+        # factor >= 0.75: 不降低（实际上已被上面的条件处理）
+        # factor >= 0.5: 降低50% (右移1位)
+        # factor >= 0.25: 降低75% (右移2位)
+        # factor < 0.25: 降低87.5% (右移3位)
+        if factor >= 0.5:
+            shift_bits = 1  # 降低50%
+        elif factor >= 0.25:
+            shift_bits = 2  # 降低75%
+        else:
+            shift_bits = 3  # 降低87.5%
+            
+        # 快速位移处理（直接操作字节）
+        for i in range(0, len(audio_data), 2):
+            # 读取16位小端有符号整数
+            low_byte = audio_data[i]
+            high_byte = audio_data[i+1]
+            
+            # 组合成16位整数
+            value = low_byte | (high_byte << 8)
+            
+            # 处理符号位
+            if high_byte & 0x80:  # 负数
+                value = value - 65536
+            
+            # 右移（降低音量）
+            value = value >> shift_bits
+            
+            # 转换回无符号表示
+            if value < 0:
+                value = value + 65536
+            
+            # 写回字节
+            audio_data[i] = value & 0xFF
+            audio_data[i+1] = (value >> 8) & 0xFF
 
     def playback_thread_func(self, socket_obj):
-        """播放线程函数 - 独立处理音频播放"""
-        print("🎵 播放线程启动")
+        """播放线程函数 - 支持AEC打断版本"""
+        print("🎵 播放线程启动（支持AEC打断）")
         
         with self.playback_thread_lock:
             self.playback_thread_active = True
@@ -274,17 +297,41 @@ class SensorSystem:
         buffer = bytearray()
         found_marker = False
         data_count = 0
-        # 降低播放音量以减少对麦克风的干扰
-        volume_reduction_factor = 0.6  # 降低到60%音量
+        # 音量设置：
+        # - 1.0 = 禁用音量调整（最佳性能）
+        # - 0.5 = 降低50%音量（用于AEC）
+        # - 0.25 = 降低75%音量
+        volume_reduction_factor = 0.5  # 启用音量降低，帮助AEC识别
+        # 增大缓冲区，减少频繁播放
+        MIN_PLAY_BUFFER = 4096  # 至少积累4KB再播放（更流畅）
+        
+        # 打断检测间隔（每播放N个包检测一次）
+        interrupt_check_interval = 5
         
         try:
             while not self.stop_playback_thread:
-                data = socket_obj.recv(1024)
+                # 🔥 每隔一定次数检测打断信号
+                if data_count % interrupt_check_interval == 0:
+                    # 检测espsr是否有新的唤醒或命令词（非阻塞）
+                    try:
+                        import espsr
+                        result = espsr.listen(1)  # 1ms超时，非阻塞检测
+                        if result == "wakeup" or (isinstance(result, dict) and "id" in result):
+                            print("🛑 检测到唤醒词打断！")
+                            self.wakeup_interrupted = True
+                            self.stop_playback_thread = True
+                            break
+                    except:
+                        pass
+                
+                # 增大接收缓冲区到4KB
+                data = socket_obj.recv(4096)
                 if data:
                     data_count += 1
-                    print(f"📡 播放线程接收数据包 #{data_count}, 大小: {len(data)} 字节")
+                    if data_count % 10 == 1:  # 每10个包打印一次日志
+                        print(f"📡 接收 #{data_count}, {len(data)}字节")
                 if not data:
-                    print("📡 播放线程：服务器连接结束")
+                    print("📡 播放线程：连接结束")
                     break
 
                 buffer.extend(data)
@@ -293,32 +340,25 @@ class SensorSystem:
                 if not found_marker and len(buffer) >= marker_len:
                     if buffer[-marker_len:] == end_marker:
                         found_marker = True
-                        print("🎵 播放线程：检测到音频结束标记")
+                        print("🎵 检测到结束标记")
                         if len(buffer) > marker_len:
-                            audio_data = buffer[:-marker_len]
-                            print(f"🔊 播放线程：播放最后音频块: {len(audio_data)} 字节")
-                            if not self.stop_playback_thread:
-                                self.audio_out.write(audio_data)
-                                audio_buffer = bytearray(audio_data)
-                                self.apply_volume_reduction(audio_buffer, volume_reduction_factor)
+                            audio_buffer = bytearray(buffer[:-marker_len])
+                            if not self.stop_playback_thread and len(audio_buffer) > 0:
+                                self.apply_volume_reduction_fast(audio_buffer, volume_reduction_factor)
                                 self.audio_out.write(audio_buffer)
                         break
-                    elif len(buffer) > 512:
+                    elif len(buffer) > MIN_PLAY_BUFFER:
                         play_len = len(buffer) - marker_len
                         if play_len > 0 and not self.stop_playback_thread:
-                            print(f"🔊 播放线程：播放音频块: {play_len} 字节")
-                            #self.audio_out.write(buffer[:play_len])
-                            # 应用音量降低
+                            # 应用快速音量调整并播放
                             audio_buffer = bytearray(buffer[:play_len])
-                            self.apply_volume_reduction(audio_buffer, volume_reduction_factor)
+                            self.apply_volume_reduction_fast(audio_buffer, volume_reduction_factor)
                             self.audio_out.write(audio_buffer)
                         buffer = buffer[play_len:]
 
                 if found_marker and len(buffer) > 0 and not self.stop_playback_thread:
-                    print(f"🔊 播放线程：播放剩余音频: {len(buffer)} 字节")
-                    # self.audio_out.write(buffer)
                     audio_buffer = bytearray(buffer)
-                    self.apply_volume_reduction(audio_buffer, volume_reduction_factor)
+                    self.apply_volume_reduction_fast(audio_buffer, volume_reduction_factor)
                     self.audio_out.write(audio_buffer)
                     buffer = bytearray()
 
@@ -668,18 +708,26 @@ class SensorSystem:
         try:
             while True:
 
+                # 🔥 AEC模式：espsr始终保持运行，不进行清理和重新初始化
                 if not self.is_wakeup_mic:
                     init_result = espsr.init()
                     if init_result:
                         print("✅ ESP-SR 初始化成功!")
+                        self.is_wakeup_mic = True
                     else:
                         print("❌ ESP-SR 初始化失败!")
                         return
 
-                print(f"\n🔍 开始监听 (1秒)... [唤醒:{wakeup_count} 命令:{command_count}]")
+                # 🔥 AEC模式：播放时不暂停监听，而是降低检测频率
+                if self.is_playing_response or self.playback_thread_active:
+                    # 播放时继续监听但降低频率，由播放线程内部进行打断检测
+                    time.sleep(0.1)  # 短暂休眠，让播放线程执行
+                    continue
+
+                print(f"\n🔍 开始监听... [唤醒:{wakeup_count} 命令:{command_count}]")
 
                 try:
-                    result = espsr.listen(40)
+                    result = espsr.listen(10)  # 缩短监听时间，提高响应速度
                     gc.collect()
                     if result == "wakeup":
                         wakeup_count += 1
@@ -688,29 +736,20 @@ class SensorSystem:
                         self.stop_playback()
                         self.playWozai()
 
-                        # 清理资源，打开录音 i2s
-                        espsr.cleanup()
+                        # 🔥 关键改动：不清理espsr，保持监听活跃以支持AEC打断
+                        # espsr.cleanup()  # 注释掉
+                        # self.is_wakeup_mic = False  # 注释掉
                         gc.collect()
-                        self.is_wakeup_mic = False
 
-                        # 开始调用录音+识别
+                        # 开始调用录音+识别（espsr保持运行）
                         self.recordToAI()
 
-                        # 检查是否被打断，如果被打断则立即重新开始监听
+                        # 🔥 检查是否被打断，如果被打断则立即开始新的录音
                         if self.wakeup_interrupted:
-                            print("🔄 检测到播放被打断，立即重新开始唤醒监听...")
+                            print("🔄 检测到播放被打断，立即开始新的录音...")
                             self.wakeup_interrupted = False
-                            # 重新初始化唤醒监听
-                            try:
-                                init_result = espsr.init()
-                                if init_result:
-                                    self.is_wakeup_mic = True
-                                    print("✅ 重新初始化ESP-SR成功，继续监听...")
-                                    continue
-                                else:
-                                    print("❌ 重新初始化ESP-SR失败!")
-                            except Exception as e:
-                                print(f"❌ 重新初始化异常: {e}")
+                            # espsr保持运行，直接开始录音
+                            self.recordToAI()
 
                     elif result == "timeout":
                         print("⏰ 监听超时，继续等待...")
@@ -739,34 +778,25 @@ class SensorSystem:
                             self.playWozai()
                             print(f"   ⚙️  执行命令ID: {command_id}")
 
-                        # 清理资源，打开录音 i2s
-                        espsr.cleanup()
+                        # 🔥 关键改动：不清理espsr，保持监听活跃以支持AEC打断
+                        # espsr.cleanup()  # 注释掉
+                        # self.is_wakeup_mic = False  # 注释掉
                         gc.collect()
-                        self.is_wakeup_mic = False
 
-                        # 开始调用录音+识别
+                        # 开始调用录音+识别（espsr保持运行）
                         self.recordToAI()
 
-                        # 检查是否被打断，如果被打断则立即重新开始监听
+                        # 🔥 检查是否被打断，如果被打断则立即开始新的录音
                         if self.wakeup_interrupted:
-                            print("🔄 检测到播放被打断，立即重新开始唤醒监听...")
+                            print("🔄 检测到播放被打断，立即开始新的录音...")
                             self.wakeup_interrupted = False
-                            # 重新初始化唤醒监听
-                            try:
-                                init_result = espsr.init()
-                                if init_result:
-                                    self.is_wakeup_mic = True
-                                    print("✅ 重新初始化ESP-SR成功，继续监听...")
-                                    continue
-                                else:
-                                    print("❌ 重新初始化ESP-SR失败!")
-                            except Exception as e:
-                                print(f"❌ 重新初始化异常: {e}")
+                            # espsr保持运行，直接开始录音
+                            self.recordToAI()
 
                     else:
                         print(f"❓ 未知结果: {result}")
 
-                    time.sleep_ms(40)
+                    time.sleep_ms(10)  # 缩短间隔，提高响应速度
 
                 except Exception as e:
                     print(f"❌ 监听异常: {e}")

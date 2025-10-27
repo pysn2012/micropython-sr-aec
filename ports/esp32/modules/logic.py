@@ -246,7 +246,7 @@ class SensorSystem:
         # 将字节数据转换为16位整数数组
         samples = array.array('h')
         for i in range(0, len(audio_data), 2):
-            sample = int.from_bytes(audio_data[i:i+2], 'little', signed=True)
+            sample = struct.unpack('<h', audio_data[i:i+2])[0]
             # 应用音量降低
             reduced_sample = int(sample * factor)
             # 防止溢出
@@ -256,9 +256,9 @@ class SensorSystem:
                 reduced_sample = -32768
             samples.append(reduced_sample)
         
-        # 将处理后的数据写回原数组
+        # 将处理后的数据写回原数组 - 使用struct.pack代替to_bytes
         for i, sample in enumerate(samples):
-            audio_data[i*2:i*2+2] = sample.to_bytes(2, 'little', signed=True)
+            audio_data[i*2:i*2+2] = struct.pack('<h', sample)
 
     def playback_thread_func(self, socket_obj):
         """播放线程函数 - 独立处理音频播放"""

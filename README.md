@@ -145,3 +145,137 @@ Before compiling a given port, use
     $ make submodules
 
 to ensure that all required submodules are initialised.
+
+---
+
+## 🎯 ESP32 + ESP-SR (语音识别) 集成版本
+
+本仓库是 MicroPython 的 ESP32 + ESP-SR 集成版本，支持语音唤醒和 AEC（回声消除）打断功能。
+
+### ✨ 主要功能
+
+- ✅ **ESP-SR 语音识别**：支持唤醒词检测和命令词识别
+- ✅ **AEC 回声消除**：播放音频时支持语音打断
+- ✅ **流式音频播放**：低内存占用的流式下载播放
+- ✅ **共享录音缓冲区**：解决 I2S 资源冲突
+- ✅ **完整测试脚本**：开箱即用的测试程序
+
+### 📚 快速开始
+
+#### 1. 编译固件
+```bash
+cd ports/esp32
+idf.py build
+idf.py flash
+```
+
+详细编译说明见：[ports/esp32/编译指南.md](ports/esp32/编译指南.md)
+
+#### 2. 运行 AEC 打断测试
+```bash
+# 上传测试脚本到设备
+# 使用 Thonny 将 ports/esp32/modules/test_logic.py 上传到 /flash/
+
+# 在 REPL 中运行
+>>> import test_logic
+>>> sensor = test_logic.SensorSystem()
+>>> sensor.run()
+```
+
+快速使用指南见：[ports/esp32/modules/README_TEST.md](ports/esp32/modules/README_TEST.md)
+
+### 📖 文档索引
+
+#### 核心文档
+- [编译指南](ports/esp32/编译指南.md) - 固件编译和烧录
+- [AEC 打断测试指南](ports/esp32/AEC打断测试指南.md) - 完整测试说明
+- [快速使用指南](ports/esp32/modules/README_TEST.md) - 快速开始
+- [文件管理清单](ports/esp32/文件管理清单.md) - 文件上传和删除清单
+
+#### 技术文档
+- **[v2.9.1 I2S冲突修复](ports/esp32/v2.9.1_I2S冲突修复.md)** - 🔥🔥🔥 **v2.9.1 最新！修复I2S冲突**
+- [v2.9 C端播放线程方案](ports/esp32/v2.9_C端播放线程方案.md) - v2.9 终极AEC解决方案
+- [v2.8 内存优化和C端喂入策略](ports/esp32/v2.8_内存优化和C端喂入策略.md) - v2.8 避免内存累积
+- [AEC VOIP模式和诊断指南](ports/esp32/AEC_VOIP模式和诊断指南.md) - v2.4 VOIP模式和诊断
+- [AEC 完整配置和降噪修复说明](ports/esp32/AEC完整配置和降噪修复说明.md) - v2.3 降噪配置
+- [AEC 时序同步修复说明](ports/esp32/AEC时序同步修复说明.md) - v2.2 时序同步
+- [VAD 功能添加说明](ports/esp32/VAD功能添加说明.md) - v2.1 VAD 集成
+- [流式播放版本更新说明](ports/esp32/流式播放版本更新说明.md) - v2.0 流式播放
+- [打断功能失败根因分析](ports/esp32/打断功能失败根因分析.md) - 问题分析
+- [AEC 打断功能修复说明](ports/esp32/AEC打断功能修复说明.md) - 修复记录
+- [I2S 资源冲突修复说明](ports/esp32/I2S资源冲突修复说明.md) - I2S 冲突解决
+- [参考项目 AEC 实现详解](ports/esp32/参考项目AEC实现详解.md) - 参考实现分析
+- [最终修复总结](ports/esp32/最终修复总结.md) - 完整修复清单
+
+### 🔧 核心修改
+
+#### C 代码修改
+1. **`modespsr.c`**
+   - 实现 AEC 参考信号缓冲区
+   - 实现共享录音缓冲区
+   - 增加队列大小（1 → 10）
+
+2. **`machine_i2s.c`**
+   - 增加 I2S 输出缓冲区（2048 → 8192）
+
+#### Python 代码
+1. **`modules/logic.py`**
+   - 主应用逻辑（用于正式产品）
+   - 支持 AEC 打断和共享录音
+
+2. **`modules/test_logic.py`**
+   - AEC 打断测试脚本（v2.0 流式播放版）
+   - 边下载边播放，解决内存溢出
+
+### 🚀 v2.0 流式播放版
+
+**主要改进**：
+- ✅ 解决内存溢出问题（内存占用从 ~200KB 降至 <8KB）
+- ✅ 支持播放任意大小的音频文件
+- ✅ 边下载边播放，延迟更低
+- ✅ 网络容错，自动重试
+
+**技术实现**：
+```python
+# v1.0 - 预下载（内存不足）
+audio_data = download_entire_file(url)  # 需要 ~200KB
+play(audio_data)
+
+# v2.0 - 流式播放
+socket = stream_from_url(url)           # 只需 ~8KB
+while data := socket.recv(4096):
+    play(data)
+```
+
+### 📦 需要上传的文件
+
+**必须上传到设备**：
+- `modules/test_logic.py` → `/flash/test_logic.py`（AEC 测试脚本）
+
+**可选上传**：
+- `modules/README_TEST.md` → `/flash/README_TEST.md`（使用说明）
+
+### 🗑️ 已删除的文件
+
+以下旧版本/过时文档已删除：
+- ❌ `test_aec_interrupt.py`（v1.0，内存溢出）
+- ❌ `AEC_IMPLEMENTATION_CHECKLIST.md`（已完成）
+- ❌ `AEC_COMPLETE_IMPLEMENTATION_GUIDE.md`（已替代）
+- ❌ `AEC实现方案总结.md`（已替代）
+
+### 🆘 技术支持
+
+遇到问题？
+1. 查看 [AEC 打断测试指南](ports/esp32/AEC打断测试指南.md)
+2. 查看 [打断功能失败根因分析](ports/esp32/打断功能失败根因分析.md)
+3. 检查 [文件管理清单](ports/esp32/文件管理清单.md)
+
+### 📝 更新日志
+
+**2025-10-27 - v2.0**
+- ✅ 实现流式音频播放，解决内存溢出
+- ✅ 优化 AEC 打断检测（队列 1→10，检测间隔 5→1）
+- ✅ 完善文档和测试脚本
+- ✅ 删除过时文档
+
+---

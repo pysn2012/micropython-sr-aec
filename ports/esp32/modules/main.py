@@ -4,7 +4,7 @@
 #import webrepl
 #webrepl.start()
 
-from logic import SensorSystem
+from test_logic import SensorSystem
 
 def main():
     system = SensorSystem()

@@ -378,19 +378,10 @@ class SensorSystem:
             tail_buf = buf[pos:]
 
             while not self.stop_playback_thread:
-                # 🔥 每隔一定次数检测打断信号（唤醒词 + VAD）
+                # 🔥 播放期间禁用唤醒监听，仅可选保留VAD打断
                 if data_count % interrupt_check_interval == 0:
                     try:
                         import espsr
-                        # 检测唤醒词/命令词
-                        result = espsr.listen(1)  # 1ms非阻塞检测
-                        if result == "wakeup" or (isinstance(result, dict) and "id" in result):
-                            print("🛑 检测到唤醒词打断！")
-                            self.wakeup_interrupted = True
-                            self.stop_playback_thread = True
-                            break
-                        
-                        # 🔥 VAD打断检测
                         is_speaking = espsr.check_vad()
                         if is_speaking:
                             print("🗣️ 检测到用户语音打断！（VAD）")
@@ -456,7 +447,7 @@ class SensorSystem:
                     sys.print_exception(e)
                     break
 
-                buffer.extend(data)
+                buffer.extend(audio_chunk)
 
                 # 检查结束标记
                 if not found_marker and len(buffer) >= marker_len:

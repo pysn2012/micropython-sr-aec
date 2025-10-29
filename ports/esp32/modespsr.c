@@ -165,7 +165,7 @@ static TaskHandle_t g_playback_task_handle = NULL;
 static volatile bool g_playback_running = false;   // 播放线程运行标志
 static volatile bool g_playback_stop_requested = false;  // 停止请求标志
 static i2s_chan_handle_t g_i2s_tx_handle = NULL;   // I2S TX句柄
-#define PLAYBACK_BUFFER_SIZE (128 * 1024)  // 128KB环形缓冲区，降低拥塞
+#define PLAYBACK_BUFFER_SIZE (64 * 1024)  // 64KB环形缓冲区，降低内存占用避免任务创建失败
 
 // VAD (Voice Activity Detection) 状态
 static volatile bool g_vad_speaking = false;  // 当前是否检测到语音
@@ -1064,10 +1064,18 @@ static mp_obj_t espsr_start_playback(void) {
     if (!espsr_initialized) {
         mp_raise_msg(&mp_type_RuntimeError, "ESP-SR not initialized");
     }
-    
+    // 若已在播放，先请求停止并等待退出，避免任务重复创建失败
     if (g_playback_running) {
-        ESP_LOGW(TAG, "Playback already running");
-        return mp_const_false;
+        ESP_LOGW(TAG, "Playback already running, stopping previous...");
+        g_playback_stop_requested = true;
+        int wait = 20;
+        while (g_playback_running && wait-- > 0) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (g_playback_running) {
+            ESP_LOGE(TAG, "Previous playback did not stop in time");
+            return mp_const_false;
+        }
     }
     
     // 清空播放缓冲区
@@ -1085,7 +1093,7 @@ static mp_obj_t espsr_start_playback(void) {
     BaseType_t ret = xTaskCreatePinnedToCore(
         playback_Task,
         "playback",
-        4096,
+        8192,  // 增大栈空间，避免栈溢出
         NULL,
         5,
         &g_playback_task_handle,

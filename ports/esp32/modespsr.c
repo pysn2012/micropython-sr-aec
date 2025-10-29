@@ -524,7 +524,7 @@ void playback_Task(void *arg) {
                 printf("[playback] Waiting for data... available=%u, need=%u\n", (unsigned)available, (unsigned)chunk_size);
             }
             // 自动空闲超时退出（无数据>1500ms）
-            if (idle_ms > 4000) { // 放宽空闲超时，避免长文件早停
+            if (idle_ms > 8000) { // 进一步放宽至8s，容忍首包/弱网
                 printf("[playback] Idle timeout, no more data. Exiting playback.\n");
                 break;
             }
@@ -560,37 +560,39 @@ void playback_Task(void *arg) {
         }
         
         // 4. 播放到I2S（32-bit 槽：将16-bit样本左移16位做MSB对齐）
-        if (g_i2s_tx_handle != NULL) {
-            const size_t sample_count = chunk_size / 2; // 16-bit 样本数
-            int16_t *s16 = (int16_t *)chunk_buffer;
-            // 480 样本（chunk_size=960字节）
-            int32_t tx_buf[480];
-            for (size_t i = 0; i < sample_count && i < (sizeof(tx_buf)/sizeof(tx_buf[0])); i++) {
-                tx_buf[i] = ((int32_t)s16[i]) << 16; // MSB 对齐
-            }
+        if (g_i2s_tx_handle == NULL) {
+            printf("[playback] ❌ g_i2s_tx_handle is NULL! Skipping I2S write.\n");
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;  // 跳过一次循环，等待句柄初始化
+        }
+        
+        const size_t sample_count = chunk_size / 2; // 16-bit 样本数
+        int16_t *s16 = (int16_t *)chunk_buffer;
+        // 480 样本（chunk_size=960字节）
+        int32_t tx_buf[480];
+        for (size_t i = 0; i < sample_count && i < (sizeof(tx_buf)/sizeof(tx_buf[0])); i++) {
+            tx_buf[i] = ((int32_t)s16[i]) << 16; // MSB 对齐
+        }
 
-            size_t written = 0;
-            esp_err_t ret = i2s_channel_write(g_i2s_tx_handle, (const void *)tx_buf, sample_count * sizeof(int32_t), &written, portMAX_DELAY);
-            if (ret == ESP_OK) {
-                bytes_written += written;
-                chunks_played++;
-                
-                if (chunks_played == 1) {
-                    printf("[playback] ✅ First chunk played! I2S TX working!\n");
-                }
-                
-                if (chunks_played % 100 == 0) {
-                    ESP_LOGI(TAG, "🔊 已播放 %lu 块 (%.1f秒)", chunks_played, (float)bytes_written / 32000.0f);
-                    printf("[playback] 🔊 Played %lu chunks (%.1f sec)\n", chunks_played, (float)bytes_written / 32000.0f);
-                }
-            } else {
-                printf("[playback] ❌ I2S write failed: ret=%d, written=%u\n", ret, (unsigned)written);
-                ESP_LOGE(TAG, "❌ I2S写入失败: %d", ret);
+        size_t written = 0;
+        esp_err_t ret = i2s_channel_write(g_i2s_tx_handle, (const void *)tx_buf, sample_count * sizeof(int32_t), &written, portMAX_DELAY);
+        if (ret == ESP_OK) {
+            bytes_written += written;
+            chunks_played++;
+            
+            if (chunks_played == 1) {
+                printf("[playback] ✅ First chunk played! I2S TX working!\n");
+            }
+            
+            if (chunks_played % 100 == 0) {
+                ESP_LOGI(TAG, "🔊 已播放 %lu 块 (%.1f秒)", chunks_played, (float)bytes_written / 32000.0f);
+                printf("[playback] 🔊 Played %lu chunks (%.1f sec)\n", chunks_played, (float)bytes_written / 32000.0f);
             }
         } else {
-            if (chunks_played == 0) {
-                printf("[playback] ❌ g_i2s_tx_handle is NULL!\n");
-            }
+            printf("[playback] ❌ I2S write failed: ret=%d, written=%u\n", ret, (unsigned)written);
+            ESP_LOGE(TAG, "❌ I2S写入失败: %d", ret);
+            // 写入失败，退出播放线程
+            break;
         }
     }
     
@@ -1158,6 +1160,12 @@ static mp_obj_t espsr_feed_playback(mp_obj_t data_obj) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(espsr_feed_playback_obj, espsr_feed_playback);
 
+// 🔎 播放运行状态查询
+static mp_obj_t espsr_is_playback_running(void) {
+    return g_playback_running ? mp_const_true : mp_const_false;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(espsr_is_playback_running_obj, espsr_is_playback_running);
+
 // 🔥 v2.9: MicroPython接口 - 停止播放线程
 static mp_obj_t espsr_stop_playback(void) {
     if (!espsr_initialized) {
@@ -1316,6 +1324,7 @@ static const mp_rom_map_elem_t espsr_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_start_playback), MP_ROM_PTR(&espsr_start_playback_obj) },
     { MP_ROM_QSTR(MP_QSTR_feed_playback), MP_ROM_PTR(&espsr_feed_playback_obj) },
     { MP_ROM_QSTR(MP_QSTR_stop_playback), MP_ROM_PTR(&espsr_stop_playback_obj) },
+    { MP_ROM_QSTR(MP_QSTR_is_playback_running), MP_ROM_PTR(&espsr_is_playback_running_obj) },
     // 调参接口
     { MP_ROM_QSTR(MP_QSTR_set_aec_params), MP_ROM_PTR(&espsr_set_aec_params_obj) },
 };

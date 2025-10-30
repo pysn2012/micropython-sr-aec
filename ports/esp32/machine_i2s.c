@@ -24,6 +24,9 @@
  * THE SOFTWARE.
  */
 
+#ifndef ESP32_I2S_C
+#define ESP32_I2S_C
+
 #include "py/mphal.h"
 #include "driver/i2s_std.h"
 #include "driver/i2s_pdm.h"
@@ -595,3 +598,5 @@ static void mp_machine_i2s_irq_update(machine_i2s_obj_t *self) {
 }
 
 MP_REGISTER_ROOT_POINTER(struct _machine_i2s_obj_t *machine_i2s_obj[I2S_NUM_AUTO]);
+
+#endif // ESP32_I2S_C

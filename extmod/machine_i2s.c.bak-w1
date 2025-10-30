@@ -1,0 +1,583 @@
+/*
+ * This file is part of the MicroPython project, http://micropython.org/
+ *
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2021 Mike Teachman
+ * Copyright (c) 2023 Damien P. George
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this softw    // 验证 GPIO 引脚
+    if (self->gpio_mclk >= 0 && (self->gpio_mclk >= GPIO_NUM_MAX || !GPIO_IS_VALID_GPIO(self->gpio_mclk))) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid MCLK GPIO number"));
+    }
+    if (self->gpio_bck >= 0 && (self->gpio_bck >= GPIO_NUM_MAX || !GPIO_IS_VALID_GPIO(self->gpio_bck))) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid BCK GPIO number"));
+    }
+    if (self->gpio_ws >= 0 && (self->gpio_ws >= GPIO_NUM_MAX || !GPIO_IS_VALID_GPIO(self->gpio_ws))) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid WS GPIO number"));
+    }
+    if (self->gpio_din >= 0 && (self->gpio_din >= GPIO_NUM_MAX || !GPIO_IS_VALID_GPIO(self->gpio_din))) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid DIN GPIO number"));
+    }
+    if (self->gpio_dout >= 0 && (self->gpio_dout >= GPIO_NUM_MAX || !GPIO_IS_VALID_GPIO(self->gpio_dout))) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid DOUT GPIO number"));
+    }
+    
+    // 初始化其他成员
+    self->buffer_size = DEFAULT_BUFFER_SIZE;
+    self->is_deinit = false;
+    self->callback_for_non_blocking = MP_OBJ_NULL;
+    self->task_handle = NULL;
+    
+    // 初始化三重缓冲区
+    esp_err_t err = init_triple_buffer(&self->triple_buf, self->buffer_size);
+    if (err != ESP_OK) {
+        mp_raise_OSError(MP_EIO);
+    }
+    
+    // 根据模式初始化 I2S
+    switch (self->mode) {
+        case MACHINE_I2S_MODE_PDM_DUPLEX:
+            err = init_pdm_duplex(self);
+            if (err != ESP_OK) {
+                mp_raise_OSError(MP_EIO);
+            }
+            break;
+            
+        case MACHINE_I2S_MODE_STANDARD:
+        case MACHINE_I2S_MODE_PDM_TX:
+        case MACHINE_I2S_MODE_PDM_RX:
+            // TODO: 实现其他模式的初始化
+            mp_raise_NotImplementedError(MP_ERROR_TEXT("I2S mode not implemented yet"));
+            break;
+            
+        default:
+            mp_raise_ValueError(MP_ERROR_TEXT("invalid I2S mode"));
+    }ed documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+#include "py/runtime.h"
+#include "py/stream.h"
+#include "py/objarray.h"
+#include "py/binary.h"
+#include "machine_i2s.h"
+#include "extmod/modmachine.h"
+
+#if MICROPY_PY_MACHINE_I2S
+
+#if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 2, 0)
+
+// ESP-IDF 头文件
+#include "driver/i2s_std.h"
+#include "driver/i2s_pdm.h"
+#include "driver/gpio.h"
+#include "esp_check.h"
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "soc/soc_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+// 常量定义
+#define TAG "machine_i2s"
+#define I2S_TASK_STACK_SIZE 4096
+#define I2S_TASK_PRIORITY 5
+#define SIZEOF_NON_BLOCKING_COPY_IN_BYTES 1024
+
+// 静态函数声明
+STATIC esp_err_t init_triple_buffer(triple_buffer_t *tb, size_t buf_size);
+STATIC void i2s_process_task(void *arg);
+STATIC esp_err_t init_pdm_duplex(machine_i2s_obj_t *self);
+
+// MicroPython对象方法声明
+STATIC mp_obj_t machine_i2s_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args);
+STATIC mp_obj_t machine_i2s_init(mp_obj_t self_in);
+STATIC mp_obj_t machine_i2s_deinit(mp_obj_t self_in);
+STATIC mp_obj_t machine_i2s_irq(mp_obj_t self_in, mp_obj_t handler);
+STATIC void machine_i2s_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind);
+
+// 三重缓冲初始化
+static esp_err_t init_triple_buffer(triple_buffer_t *tb, size_t buf_size) {
+    tb->buf_size = buf_size;
+    tb->active_buf = 0;
+    tb->process_buf = 1;
+    tb->ready_buf = 2;
+    
+    for (int i = 0; i < 3; i++) {
+        tb->buffers[i] = heap_caps_malloc(buf_size, MALLOC_CAP_8BIT);
+        if (!tb->buffers[i]) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    
+    tb->mutex = xSemaphoreCreateMutex();
+    if (!tb->mutex) {
+        return ESP_ERR_NO_MEM;
+    }
+    
+    return ESP_OK;
+}
+
+// PDM 双工初始化
+static esp_err_t init_pdm_duplex(machine_i2s_obj_t *self) {
+    // 创建通道配置
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
+    
+    // PDM 发送配置
+    i2s_pdm_tx_config_t pdm_tx_cfg = {
+        .clk_cfg = I2S_PDM_TX_CLK_DEFAULT_CONFIG(self->sample_rate_hz),
+        .slot_cfg = I2S_PDM_TX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .clk = self->gpio_mclk,
+            .dout = self->gpio_dout
+        }
+    };
+    
+    // PDM 接收配置
+    i2s_pdm_rx_config_t pdm_rx_cfg = {
+        .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(self->sample_rate_hz),
+        .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .clk = self->gpio_mclk,
+            .din = self->gpio_din
+        }
+    };
+    
+        esp_err_t err;
+    
+    // 创建 I2S 通道
+    err = i2s_new_channel(&chan_cfg, &self->tx_handle, &self->rx_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create I2S channels: %d", err);
+        return err;
+    }
+    
+    // 初始化 PDM 发送和接收模式
+    err = i2s_channel_init_pdm_tx_mode(self->tx_handle, &pdm_tx_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to init PDM TX mode: %d", err);
+        return err;
+    }
+    
+    err = i2s_channel_init_pdm_rx_mode(self->rx_handle, &pdm_rx_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to init PDM RX mode: %d", err);
+        return err;
+    }
+    
+    // 启用通道
+    err = i2s_channel_enable(self->tx_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable TX channel: %d", err);
+        return err;
+    }
+    
+    err = i2s_channel_enable(self->rx_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable RX channel: %d", err);
+        return err;
+    }
+    
+    return ESP_OK;
+}
+
+// 数据处理任务
+static void i2s_process_task(void *arg) {
+    machine_i2s_obj_t *self = (machine_i2s_obj_t *)arg;
+    size_t bytes_written = 0;
+    size_t bytes_read = 0;
+    
+    while (1) {
+        // 读取 PDM 数据
+        ESP_ERROR_CHECK(i2s_channel_read(self->rx_handle,
+            self->triple_buf.buffers[self->triple_buf.active_buf],
+            self->triple_buf.buf_size,
+            &bytes_read,
+            pdMS_TO_TICKS(100)));
+            
+        if (bytes_read > 0) {
+            // 处理缓冲区切换
+            xSemaphoreTake(self->triple_buf.mutex, portMAX_DELAY);
+            int temp = self->triple_buf.active_buf;
+            self->triple_buf.active_buf = self->triple_buf.process_buf;
+            self->triple_buf.process_buf = self->triple_buf.ready_buf;
+            self->triple_buf.ready_buf = temp;
+            xSemaphoreGive(self->triple_buf.mutex);
+            
+            // 回调通知新数据可用
+            if (self->callback_for_non_blocking != MP_OBJ_NULL) {
+                mp_call_function_1(self->callback_for_non_blocking, MP_OBJ_FROM_PTR(self));
+            }
+        }
+        
+        // 检查是否有数据要写入
+        size_t bytes_to_write = self->triple_buf.buf_size;
+        ESP_ERROR_CHECK(i2s_channel_write(self->tx_handle,
+            self->triple_buf.buffers[self->triple_buf.ready_buf],
+            bytes_to_write,
+            &bytes_written,
+            pdMS_TO_TICKS(100)));
+    }
+}
+
+// I2S 对象构造函数
+STATIC mp_obj_t machine_i2s_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args) {
+    mp_arg_check_num(n_args, n_kw, 1, MP_OBJ_FUN_ARGS_MAX, true);
+    
+    // 创建新对象
+    machine_i2s_obj_t *self = mp_obj_malloc(machine_i2s_obj_t, &machine_i2s_type);
+    
+    // 解析参数
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_id,       MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_mode,     MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = MACHINE_I2S_MODE_STANDARD} },
+        { MP_QSTR_rate,     MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = DEFAULT_SAMPLE_RATE} },
+        { MP_QSTR_bits,     MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 16} },
+        { MP_QSTR_format,   MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_channels, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 1} },
+        { MP_QSTR_mclk,     MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NEW_SMALL_INT(-1)} },
+        { MP_QSTR_bck,      MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NEW_SMALL_INT(-1)} },
+        { MP_QSTR_ws,       MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NEW_SMALL_INT(-1)} },
+        { MP_QSTR_din,      MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NEW_SMALL_INT(-1)} },
+        { MP_QSTR_dout,     MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NEW_SMALL_INT(-1)} },
+    };
+    
+    mp_arg_val_t parsed_args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all_kw_array(n_args, n_kw, args, MP_ARRAY_SIZE(allowed_args), allowed_args, parsed_args);
+    
+    // 设置基本参数
+    if (n_args + n_kw > MP_ARRAY_SIZE(allowed_args)) {
+        mp_raise_ValueError(MP_ERROR_TEXT("too many arguments"));
+    }
+    
+    mp_map_t kw_args;
+    mp_map_init_fixed_table(&kw_args, n_kw, args + n_args);
+    mp_arg_val_t args_parsed[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args, args, &kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args_parsed);
+    
+    // 验证和设置参数
+    int8_t i2s_id = args_parsed[0].u_int;
+    if (i2s_id < 0 || i2s_id >= SOC_I2S_NUM) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid I2S peripheral ID"));
+    }
+    self->i2s_id = i2s_id;
+    
+    // 设置 I2S 模式
+    uint8_t mode = args_parsed[1].u_int;
+    if (mode != MACHINE_I2S_MODE_STANDARD && 
+        mode != MACHINE_I2S_MODE_PDM_TX && 
+        mode != MACHINE_I2S_MODE_PDM_RX && 
+        mode != MACHINE_I2S_MODE_PDM_DUPLEX) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid I2S mode"));
+    }
+    self->mode = mode;
+    
+    // 采样率
+    int sample_rate = args_parsed[2].u_int;
+    if (sample_rate < 8000 || sample_rate > 48000) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid sample rate"));
+    }
+    self->sample_rate_hz = sample_rate;
+    
+    // 位深度
+    int bits = args_parsed[3].u_int;
+    if (bits != 16 && bits != 24 && bits != 32) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid bits per sample"));
+    }
+    self->bits = bits;
+    
+    self->format = args_parsed[4].u_int;
+    
+    // 通道数
+    int channels = args_parsed[5].u_int;
+    if (channels != 1 && channels != 2) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid number of channels"));
+    }
+    self->channel_count = channels;
+    
+    // GPIO 引脚
+    self->gpio_mclk = mp_obj_get_int(args_parsed[6].u_obj);
+    self->gpio_bck = mp_obj_get_int(args_parsed[7].u_obj);
+    self->gpio_ws = mp_obj_get_int(args_parsed[8].u_obj);
+    self->gpio_din = mp_obj_get_int(args_parsed[9].u_obj);
+    self->gpio_dout = mp_obj_get_int(args_parsed[10].u_obj);
+    
+    // 验证 GPIO 引脚
+    if (self->gpio_mclk >= 0 && (self->gpio_mclk >= GPIO_NUM_MAX || !GPIO_IS_VALID_GPIO(self->gpio_mclk))) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid MCLK GPIO number"));
+    }
+    if (self->gpio_bck >= 0 && (self->gpio_bck >= GPIO_NUM_MAX || !GPIO_IS_VALID_GPIO(self->gpio_bck))) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid BCK GPIO number"));
+    }
+    if (self->gpio_ws >= 0 && (self->gpio_ws >= GPIO_NUM_MAX || !GPIO_IS_VALID_GPIO(self->gpio_ws))) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid WS GPIO number"));
+    }
+    if (self->gpio_din >= 0 && (self->gpio_din >= GPIO_NUM_MAX || !GPIO_IS_VALID_GPIO(self->gpio_din))) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid DIN GPIO number"));
+    }
+    if (self->gpio_dout >= 0 && (self->gpio_dout >= GPIO_NUM_MAX || !GPIO_IS_VALID_GPIO(self->gpio_dout))) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid DOUT GPIO number"));
+    }
+    
+    // 初始化缓冲区
+    self->buffer_size = 1024;  // 可配置的缓冲区大小
+    ESP_ERROR_CHECK(init_triple_buffer(&self->triple_buf, self->buffer_size));
+    
+    // 初始化 I2S
+    if (self->mode == MACHINE_I2S_MODE_PDM_DUPLEX) {
+        ESP_ERROR_CHECK(init_pdm_duplex(self));
+        
+        // 创建处理任务
+        xTaskCreate(i2s_process_task, "i2s_task", I2S_TASK_STACK_SIZE, 
+                   self, I2S_TASK_PRIORITY, &self->task_handle);
+    }
+    
+    return MP_OBJ_FROM_PTR(self);
+}
+
+// 常量定义表
+// 初始化方法
+STATIC mp_obj_t machine_i2s_init(mp_obj_t self_in) {
+    machine_i2s_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->is_deinit) {
+        return mp_const_none;
+    }
+    
+    // 重新初始化
+    esp_err_t err = init_triple_buffer(&self->triple_buf, self->buffer_size);
+    if (err != ESP_OK) {
+        mp_raise_OSError(MP_EIO);
+    }
+    
+    switch (self->mode) {
+        case MACHINE_I2S_MODE_PDM_DUPLEX:
+            err = init_pdm_duplex(self);
+            break;
+        // TODO: 添加其他模式的初始化
+        default:
+            mp_raise_ValueError(MP_ERROR_TEXT("invalid I2S mode"));
+    }
+    
+    if (err != ESP_OK) {
+        mp_raise_OSError(MP_EIO);
+    }
+    
+    self->is_deinit = false;
+    return mp_const_none;
+}
+MP_DEFINE_CONST_FUN_OBJ_1(machine_i2s_init_obj, machine_i2s_init);
+
+// 反初始化方法
+STATIC mp_obj_t machine_i2s_deinit(mp_obj_t self_in) {
+    machine_i2s_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (self->is_deinit) {
+        return mp_const_none;
+    }
+    
+    // 停止和删除任务
+    if (self->task_handle != NULL) {
+        vTaskDelete(self->task_handle);
+        self->task_handle = NULL;
+    }
+    
+    // 停止和删除 I2S 通道
+    if (self->tx_handle != NULL) {
+        i2s_channel_disable(self->tx_handle);
+        i2s_del_channel(self->tx_handle);
+        self->tx_handle = NULL;
+    }
+    if (self->rx_handle != NULL) {
+        i2s_channel_disable(self->rx_handle);
+        i2s_del_channel(self->rx_handle);
+        self->rx_handle = NULL;
+    }
+    
+    // 释放三重缓冲区
+    for (int i = 0; i < 3; i++) {
+        if (self->triple_buf.buffers[i] != NULL) {
+            heap_caps_free(self->triple_buf.buffers[i]);
+            self->triple_buf.buffers[i] = NULL;
+        }
+    }
+    if (self->triple_buf.mutex != NULL) {
+        vSemaphoreDelete(self->triple_buf.mutex);
+        self->triple_buf.mutex = NULL;
+    }
+    
+    self->is_deinit = true;
+    return mp_const_none;
+}
+MP_DEFINE_CONST_FUN_OBJ_1(machine_i2s_deinit_obj, machine_i2s_deinit);
+
+// 中断回调设置方法
+STATIC mp_obj_t machine_i2s_irq(mp_obj_t self_in, mp_obj_t callback) {
+    machine_i2s_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (callback == mp_const_none) {
+        self->callback_for_non_blocking = MP_OBJ_NULL;
+    } else {
+        self->callback_for_non_blocking = callback;
+    }
+    return mp_const_none;
+}
+MP_DEFINE_CONST_FUN_OBJ_2(machine_i2s_irq_obj, machine_i2s_irq);
+
+// 打印对象信息
+STATIC void machine_i2s_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
+    machine_i2s_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    mp_printf(print, "I2S(id=%u, mode=%u, rate=%u, bits=%u, channels=%u)",
+        self->i2s_id, self->mode, self->sample_rate_hz, self->bits, self->channel_count);
+}
+
+// 本地字典表
+STATIC const mp_rom_map_elem_t machine_i2s_locals_dict_table[] = {
+    { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_I2S) },
+    
+    // 常量
+    { MP_ROM_QSTR(MP_QSTR_STANDARD), MP_ROM_INT(MACHINE_I2S_MODE_STANDARD) },
+    { MP_ROM_QSTR(MP_QSTR_PDM_TX), MP_ROM_INT(MACHINE_I2S_MODE_PDM_TX) },
+    { MP_ROM_QSTR(MP_QSTR_PDM_RX), MP_ROM_INT(MACHINE_I2S_MODE_PDM_RX) },
+    { MP_ROM_QSTR(MP_QSTR_PDM_DUPLEX), MP_ROM_INT(MACHINE_I2S_MODE_PDM_DUPLEX) },
+    
+    // 方法
+    { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&machine_i2s_init_obj) },
+    { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&machine_i2s_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR_irq), MP_ROM_PTR(&machine_i2s_irq_obj) },
+};
+STATIC MP_DEFINE_CONST_DICT(machine_i2s_locals_dict, machine_i2s_locals_dict_table);
+
+// 流读取方法
+STATIC mp_uint_t machine_i2s_stream_read(mp_obj_t self_in, void *buf_in, mp_uint_t size, int *errcode) {
+    machine_i2s_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    // 检查状态
+    if (self->is_deinit) {
+        *errcode = MP_EPIPE;
+        return 0;
+    }
+    
+    if (self->rx_handle == NULL) {
+        *errcode = MP_EPIPE;
+        return 0;
+    }
+    
+    uint8_t *buf = buf_in;
+    mp_uint_t bytes_read = 0;
+    
+    // 从活动缓冲区读取数据
+    xSemaphoreTake(self->triple_buf.mutex, portMAX_DELAY);
+    if (size > self->triple_buf.buf_size) {
+        size = self->triple_buf.buf_size;
+    }
+    memcpy(buf, self->triple_buf.buffers[self->triple_buf.process_buf], size);
+    bytes_read = size;
+    xSemaphoreGive(self->triple_buf.mutex);
+    
+    *errcode = 0;
+    return bytes_read;
+}
+
+// 流写入方法
+STATIC mp_uint_t machine_i2s_stream_write(mp_obj_t self_in, const void *buf_in, mp_uint_t size, int *errcode) {
+    machine_i2s_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    // 检查状态
+    if (self->is_deinit) {
+        *errcode = MP_EPIPE;
+        return 0;
+    }
+    
+    if (self->tx_handle == NULL) {
+        *errcode = MP_EPIPE;
+        return 0;
+    }
+    
+    const uint8_t *buf = buf_in;
+    mp_uint_t bytes_to_write = size;
+    mp_uint_t bytes_written = 0;
+    
+    // 写入到准备好的缓冲区
+    xSemaphoreTake(self->triple_buf.mutex, portMAX_DELAY);
+    if (bytes_to_write > self->triple_buf.buf_size) {
+        bytes_to_write = self->triple_buf.buf_size;
+    }
+    memcpy(self->triple_buf.buffers[self->triple_buf.ready_buf], buf, bytes_to_write);
+    bytes_written = bytes_to_write;
+    xSemaphoreGive(self->triple_buf.mutex);
+    
+    *errcode = 0;
+    return bytes_written;
+}
+
+// ioctl 方法用于特殊控制操作
+STATIC mp_uint_t machine_i2s_ioctl(mp_obj_t self_in, mp_uint_t request, uintptr_t arg, int *errcode) {
+    machine_i2s_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    mp_uint_t ret = 0;
+    
+    if (self->is_deinit) {
+        *errcode = MP_EPIPE;
+        return 0;
+    }
+    
+    switch (request) {
+        case MP_STREAM_POLL: {
+            mp_uint_t flags = arg;
+            ret = 0;
+            
+            if ((flags & MP_STREAM_POLL_RD) && self->rx_handle) {
+                ret |= MP_STREAM_POLL_RD;
+            }
+            if ((flags & MP_STREAM_POLL_WR) && self->tx_handle) {
+                ret |= MP_STREAM_POLL_WR;
+            }
+            *errcode = 0;
+            break;
+        }
+        
+        default:
+            *errcode = MP_EINVAL;
+            ret = MP_STREAM_ERROR;
+    }
+    
+    return ret;
+}
+
+// 流协议
+STATIC const mp_stream_p_t i2s_stream_p = {
+    .read = machine_i2s_stream_read,
+    .write = machine_i2s_stream_write,
+    .ioctl = machine_i2s_ioctl,
+    .is_text = false,
+};
+
+// 类型对象定义
+const mp_obj_type_t machine_i2s_type = {
+    .base = { &mp_type_type },
+    .name = MP_QSTR_I2S,
+    .make_new = machine_i2s_make_new,
+    .print = machine_i2s_print,
+    .locals_dict = (mp_obj_dict_t *)&machine_i2s_locals_dict,
+    .buffer_p = {
+        .stream_p = &i2s_stream_p,
+    },
+};
+
+#endif // ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 2, 0)
+#endif // MICROPY_PY_MACHINE_I2S

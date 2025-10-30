@@ -2,6 +2,75 @@
  * MicroPython ESP-SR binding (完全参照project-i2s-wakup-new)
  * 支持唤醒词（嗨，乐鑫）和命令词识别，AFE+WakeNet+MultiNet全流程
  */
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <time.h>
+
+// AEC 配置参数
+#define AEC_SUPPRESSION_LEVEL 0.6f
+#define AEC_FILTER_LENGTH 512
+#define VAD_WINDOW_MS 30
+
+// VAD 相关参数
+#define VAD_THRESHOLD 5000          // VAD能量阈值
+#define VAD_MIN_DURATION_MS 180     // 最小有效语音持续时间(ms)
+#define VAD_MAX_SILENCE_MS 500      // 最大静音时间(ms)
+#define VAD_PRE_SPEECH_MS 200       // 预留语音时间(ms)
+#define VAD_DEBOUNCE_FRAMES 6       // 连续帧数(30ms*6≈180ms)后才认为语音成立
+
+// 音频配置结构体
+typedef struct {
+    // 基本配置
+    bool aec_enabled;          // AEC 使能状态
+    bool vad_enabled;          // VAD 使能状态
+    bool interrupt_enabled;     // 播放打断使能状态
+    uint32_t sample_rate;      // 采样率
+    uint8_t channels;          // 通道数
+    uint8_t bits_per_sample;   // 采样位数
+
+    // 能量检测相关
+    float last_mic_energy;     // 最近麦克风能量值
+    float last_ref_energy;     // 最近参考信号能量值
+    bool ref_active_recent;    // 最近是否有参考信号活动
+    float min_interrupt_energy;// 最小打断能量阈值
+    float vad_threshold;       // VAD能量阈值
+
+    // 时间控制相关
+    uint64_t last_interrupt_time;  // 上次打断时间
+    uint32_t interrupt_cooldown_ms;// 打断冷却时间(毫秒)
+} audio_config_t;
+
+// 全局配置实例
+static audio_config_t g_audio_config = {
+    // 基本配置
+    .aec_enabled = true,
+    .vad_enabled = true,
+    .interrupt_enabled = true,
+    .sample_rate = 16000,
+    .channels = 1,
+    .bits_per_sample = 16,
+
+    // 能量检测相关
+    .last_mic_energy = 0.0f,
+    .last_ref_energy = 0.0f,
+    .ref_active_recent = false,
+    .min_interrupt_energy = 5000.0f,
+    .vad_threshold = 5000.0f,
+
+    // 时间控制相关
+    .last_interrupt_time = 0,
+    .interrupt_cooldown_ms = 500  // 500ms 冷却时间
+};
+
+// 状态变量
+static volatile uint32_t g_ref_active_feeds = 0;     // 参考信号活跃的 feed 次数
+
+// VAD 相关参数
+#define VAD_THRESHOLD 5000          // VAD能量阈值
+#define VAD_MIN_DURATION_MS 180     // 最小有效语音持续时间(ms)
+#define VAD_MAX_SILENCE_MS 500      // 最大静音时间(ms)
+#define VAD_PRE_SPEECH_MS 200       // 预留语音时间(ms)
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -85,20 +154,105 @@ static int64_t g_last_reference_time_us = 0;  // 最后一次写入参考信号�
 #define REFERENCE_TIMEOUT_MS 100              // 参考信号超时时间（毫秒）
 static int g_ref_delay_samples = (REFERENCE_DELAY_MS * 16000) / 1000;
 
+// AEC 处理函数
+static void process_aec(int16_t *mic_buffer, int16_t *ref_buffer, size_t samples) {
+    if (!g_audio_config.aec_enabled) {
+        return;
+    }
+    
+    // 调用 ESP-AEC 处理
+    if (afe_handle && afe_data) {
+        // 计算信号能量
+        uint32_t mic_energy = 0;
+        uint32_t ref_energy = 0;
+        for (size_t i = 0; i < samples; i++) {
+            mic_energy += abs(mic_buffer[i]);
+            ref_energy += abs(ref_buffer[i]);
+        }
+        g_audio_config.last_mic_energy = mic_energy;
+        g_audio_config.last_ref_energy = ref_energy;
+        
+        // 更新参考信号状态
+        g_audio_config.ref_active_recent = (ref_energy > g_audio_config.min_interrupt_energy);
+        
+        // 应用 AEC - 直接调用 feed 方法进行回声消除
+        if (afe_handle->feed) {
+            afe_handle->feed(afe_data, ref_buffer);
+        }
+    }
+}
+
+// VAD 检测函数
+static bool detect_voice_activity(int16_t *buffer, size_t samples) {
+    static int vad_debounce_counter = 0;  // VAD 防抖计数器
+    
+    if (!g_audio_config.vad_enabled) {
+        vad_debounce_counter = 0;
+        return false;
+    }
+    
+    // 计算能量
+    uint32_t energy = 0;
+    for (size_t i = 0; i < samples; i++) {
+        energy += abs(buffer[i]);
+    }
+    
+    // 应用阈值判断
+    float energy_level = (float)energy / (samples * 32768.0f);
+    bool current_frame_active = energy_level > g_audio_config.vad_threshold;
+    
+    // 应用防抖逻辑
+    if (current_frame_active) {
+        vad_debounce_counter++;
+        if (vad_debounce_counter >= VAD_DEBOUNCE_FRAMES) {
+            return true;
+        }
+    } else {
+        vad_debounce_counter = 0;
+    }
+    
+    return false;
+}
+
+// 检查是否允许打断
+static bool can_interrupt(void) {
+    if (!g_audio_config.interrupt_enabled) {
+        return false;
+    }
+    
+    // 检查冷却时间
+    int64_t current_time = esp_timer_get_time();
+    if (current_time - g_audio_config.last_interrupt_time < 
+        g_audio_config.interrupt_cooldown_ms * 1000) {
+        return false;
+    }
+    
+    // 检查麦克风能量是否足够大
+    if (g_audio_config.last_mic_energy < g_audio_config.min_interrupt_energy) {
+        return false;
+    }
+    
+    // 检查是否有参考信号活动
+    if (!g_audio_config.ref_active_recent) {
+        return false;
+    }
+    
+    return true;
+}
+
 // 🔥 诊断统计（用于排查AEC问题）
 static uint32_t g_feed_count = 0;           // feed 调用总次数
-static uint32_t g_ref_active_feeds = 0;     // 参考信号活跃的 feed 次数
 static uint32_t g_ref_nonzero_samples = 0;  // 参考信号非零采样点数
 static uint32_t g_ref_total_samples = 0;    // 参考信号总采样点数
 static uint32_t g_ref_feed_calls = 0;       // espsr.feed_reference() 被调用次数
 static bool g_ref_phase_initialized = false; // 参考读相位是否已建立
 // 参考增益（移位），用于匹配扬声器幅度：0=不增益，1=×2，2=×4 ...
 static int g_ref_gain_shift = 1;
-// 播放/参考状态与能量（用于抑制播放期VAD自打断）
-static volatile uint32_t g_last_mic_energy = 0;
-static volatile uint32_t g_last_ref_energy = 0;
-static volatile bool g_ref_active_recent = false;
-static int g_vad_debounce_needed = 6; // 连续帧数(30ms*6≈180ms)后才认为语音成立
+// AFE 配置参数
+#define AEC_SUPPRESSION_LEVEL 0.6f
+#define AEC_FILTER_LENGTH 512
+#define VAD_WINDOW_MS 30
+// VAD 状态计数器在 detect_voice_activity 函数中作为静态局部变量使用
 static int g_energy_threshold_ratio = 8; // 播放期能量阈值比例（默认8倍）
 
 // 参考管理器（Deepseek方案）
@@ -154,20 +308,17 @@ static SemaphoreHandle_t g_record_mutex = NULL;
 static bool g_recording_enabled = false;  // 录音使能标志
 #define RECORD_BUFFER_SIZE (16000 * 10)  // 10秒缓冲 (16kHz采样率)
 
-// 🔥 v2.9: 播放数据缓冲区（C端独立播放线程）
-static uint8_t *g_playback_buffer = NULL;       // 播放缓冲区（字节流）
-static size_t g_playback_buffer_size = 0;
-static size_t g_playback_write_index = 0;
-static size_t g_playback_read_index = 0;
-static size_t g_playback_data_size = 0;         // 缓冲区中有效字节数（避免满/空歧义）
-static SemaphoreHandle_t g_playback_mutex = NULL;
-static TaskHandle_t g_playback_task_handle = NULL;
-static volatile bool g_playback_running = false;   // 播放线程运行标志
-static volatile bool g_playback_stop_requested = false;  // 停止请求标志
-static i2s_chan_handle_t g_i2s_tx_handle = NULL;   // I2S TX句柄
-#define PLAYBACK_BUFFER_SIZE (64 * 1024)  // 64KB环形缓冲区，降低内存占用避免任务创建失败
-
-// VAD (Voice Activity Detection) 状态
+    // 播放相关
+    static uint8_t *g_playback_buffer = NULL;       // 播放缓冲区
+    static size_t g_playback_buffer_size = 0;
+    static size_t g_playback_write_index = 0;
+    static size_t g_playback_read_index = 0;
+    static SemaphoreHandle_t g_playback_mutex = NULL;
+    static TaskHandle_t g_playback_task_handle = NULL;
+    static volatile bool g_playback_running = false;
+    static volatile bool g_playback_stop_requested = false;
+    static i2s_chan_handle_t g_i2s_tx_handle = NULL;
+    #define PLAYBACK_BUFFER_SIZE (32 * 1024)  // 32KB缓冲区// VAD (Voice Activity Detection) 状态
 static volatile bool g_vad_speaking = false;  // 当前是否检测到语音
 static SemaphoreHandle_t g_vad_mutex = NULL;
 
@@ -206,9 +357,6 @@ static void init_i2s(void) {
     
     // 创建I2S0 RX通道
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &rx_handle));
-    
-    // I2S标准配置
-    i2s_std_config_t std_cfg; // 未使用，避免未使用警告（保留占位以便需要时恢复STD RX）
     // Configure PDM RX mode
     i2s_pdm_rx_config_t pdm_rx_cfg = {
         .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(16000),
@@ -221,6 +369,7 @@ static void init_i2s(void) {
             },
         },
     };
+    // 我们已经转向PDM模式，不再需要STD配置
     
     // 初始化I2S0 RX为PDM模式（麦克风）
     ESP_ERROR_CHECK(i2s_channel_init_pdm_rx_mode(rx_handle, &pdm_rx_cfg));
@@ -239,8 +388,7 @@ static void init_i2s(void) {
     
     i2s_std_config_t tx_std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(16000),
-        // 对齐参考项目：MSB + 32-bit 槽，单声道
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+        .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = GPIO_NUM_15,
@@ -254,8 +402,6 @@ static void init_i2s(void) {
             },
         },
     };
-    // 单声道右声道输出
-    tx_std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_RIGHT;
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(g_i2s_tx_handle, &tx_std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(g_i2s_tx_handle));
     ESP_LOGI(TAG, "I2S1 TX (playback) initialized");
@@ -268,9 +414,15 @@ void feed_Task(void *arg) {
     esp_afe_sr_data_t *afe_data = arg;
     int feed_chunksize = afe_handle->get_feed_chunksize(afe_data);
     int feed_nch = afe_handle->get_feed_channel_num(afe_data);
-    int16_t *feed_buff = (int16_t *) malloc(feed_chunksize * feed_nch * sizeof(int16_t));
     
-    assert(feed_buff);
+    // 使用静态分配避免内存碎片
+    static int16_t feed_buff[2048 * 2];  // 足够大的静态缓冲区（支持2048采样点 * 2通道）
+    if (feed_chunksize * feed_nch > sizeof(feed_buff)/sizeof(feed_buff[0])) {
+        ESP_LOGE(TAG, "Feed buffer too small for chunksize=%d channels=%d", feed_chunksize, feed_nch);
+        vTaskDelete(NULL);
+        return;
+    }
+    
     ESP_LOGI(TAG, "Feed task started: chunksize=%d, channels=%d", feed_chunksize, feed_nch);
     
     while (task_flag) {
@@ -335,9 +487,9 @@ void feed_Task(void *arg) {
                     mic_energy += (uint32_t)(m >= 0 ? m : -m);
                     ref_energy += (uint32_t)(r >= 0 ? r : -r);
                 }
-                g_last_mic_energy = mic_energy;
-                g_last_ref_energy = ref_energy;
-                g_ref_active_recent = ref_active;
+                g_audio_config.last_mic_energy = mic_energy;
+                g_audio_config.last_ref_energy = ref_energy;
+                g_audio_config.ref_active_recent = ref_active;
                 
                 // 🔥 每3秒打印一次诊断信息（16kHz采样率，480采样点/次，约33次/秒，100次约3秒）
                 if (g_feed_count % 100 == 0) {
@@ -385,10 +537,7 @@ void feed_Task(void *arg) {
         free(mic_data);
     }
     
-    if (feed_buff) {
-        free(feed_buff);
-        feed_buff = NULL;
-    }
+    // feed_buff 是静态分配的，不需要释放
     vTaskDelete(NULL);
 }
 
@@ -408,31 +557,36 @@ void detect_Task(void *arg) {
             break;
         }
 
-        // 🔥 更新 VAD 状态（语音活动检测）
+        // 更新 VAD 状态和打断检测
         if (g_vad_mutex != NULL && xSemaphoreTake(g_vad_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-            static int vad_true_streak = 0; // 去抖计数
-            bool new_speaking = (res->vad_state == VAD_SPEECH);
-
-            // 播放期能量抑制：参考能量显著高于麦克且参考活跃，压制为静音
-            if (new_speaking && g_ref_active_recent) {
-                if (g_last_ref_energy > (uint32_t)(g_last_mic_energy * (uint32_t)g_energy_threshold_ratio)) { // 默认8x，可调
-                    new_speaking = false;
-                }
+            // 处理 AEC
+            process_aec((int16_t *)res->data, (int16_t *)res->data, res->data_size / sizeof(int16_t));
+            
+            // VAD 检测
+            bool new_speaking = detect_voice_activity((int16_t *)res->data, res->data_size / sizeof(int16_t));
+            
+            // 检查是否需要打断
+            if (new_speaking && can_interrupt()) {
+                ESP_LOGI(TAG, "检测到语音打断");
+                g_audio_config.last_interrupt_time = esp_timer_get_time();
+                
+                // 发送打断事件
+                sr_result_t result = {
+                    .wakenet_mode = WAKENET_DETECTED,
+                    .state = ESP_MN_STATE_DETECTED,
+                    .command_id = -1  // 特殊ID表示打断
+                };
+                xQueueSend(g_result_que, &result, 10);
+                
+                // 停止当前播放
+                g_playback_stop_requested = true;
             }
-
-            // 去抖：需要连续 N 帧为真才拉起
-            if (new_speaking) {
-                vad_true_streak++;
-                if (vad_true_streak < g_vad_debounce_needed) {
-                    new_speaking = false;
-                }
-            } else {
-                vad_true_streak = 0;
-            }
+            
             if (new_speaking != g_vad_speaking) {
                 g_vad_speaking = new_speaking;
-                // ESP_LOGI(TAG, "VAD state changed: %s", new_speaking ? "SPEECH" : "SILENCE");
+                ESP_LOGD(TAG, "VAD state changed: %s", new_speaking ? "SPEECH" : "SILENCE");
             }
+            
             xSemaphoreGive(g_vad_mutex);
         }
 
@@ -486,45 +640,69 @@ void detect_Task(void *arg) {
 
 // 🔥 v2.9: 播放任务（C端独立管理播放和AEC喂入）
 void playback_Task(void *arg) {
-    ESP_LOGI(TAG, "🎵 播放线程已启动");
-    printf("[playback] Task started, waiting for data...\n");
+    ESP_LOGI(TAG, "播放任务已启动");
     
-    const size_t chunk_size = 960;  // 30ms @ 16kHz, 16bit
+    const size_t chunk_size = 320;  // 10ms @ 16kHz, 16bit
     uint8_t *chunk_buffer = (uint8_t *)malloc(chunk_size);
-    if (!chunk_buffer) {
-        ESP_LOGE(TAG, "❌ 播放线程：内存分配失败");
+    uint8_t *ref_buffer = (uint8_t *)malloc(chunk_size);  // AEC 参考信号缓冲区
+    
+    if (!chunk_buffer || !ref_buffer) {
+        ESP_LOGE(TAG, "缓冲区分配失败");
+        if (chunk_buffer) free(chunk_buffer);
+        if (ref_buffer) free(ref_buffer);
         g_playback_running = false;
         vTaskDelete(NULL);
         return;
     }
+    
+    memset(chunk_buffer, 0, chunk_size);
+    memset(ref_buffer, 0, chunk_size);
     
     size_t bytes_written = 0;
     uint32_t chunks_played = 0;
     uint32_t wait_count = 0;
     uint32_t idle_ms = 0;
     
+    printf("[playback] Starting main loop...\n");
     while (!g_playback_stop_requested) {
-        // 1. 从播放缓冲区读取数据
+        // 1. 检查数据可用性
         size_t available = 0;
-        if (xSemaphoreTake(g_playback_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            available = g_playback_data_size; // 直接使用有效字节数
-            xSemaphoreGive(g_playback_mutex);
-        }
+        bool got_mutex = false;
         
-        // 🔥 诊断：打印可用数据量
-        if (chunks_played == 0 && available > 0) {
-            printf("[playback] First data available: %u bytes\n", (unsigned)available);
+        // 尝试获取互斥量
+        if (xSemaphoreTake(g_playback_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            got_mutex = true;
+            available = (g_playback_write_index >= g_playback_read_index) ? 
+                (g_playback_write_index - g_playback_read_index) : 
+                (g_playback_buffer_size - g_playback_read_index + g_playback_write_index);
+            
+            // 如果有数据，打印首次数据状态
+            if (chunks_played == 0 && available > 0) {
+                printf("[playback] First data check: %u bytes, write=%u, read=%u\n", 
+                    (unsigned)available, 
+                    (unsigned)g_playback_write_index,
+                    (unsigned)g_playback_read_index);
+            }
+            xSemaphoreGive(g_playback_mutex);
+        } else {
+            ESP_LOGW(TAG, "⚠️ 无法获取播放互斥量");
         }
         
         // 如果数据不足，等待
-        if (available < chunk_size) {
+        if (!got_mutex || available < chunk_size) {
             wait_count++;
-            idle_ms += 5;
-            if (wait_count % 20 == 1) {
-                printf("[playback] Waiting for data... available=%u, need=%u\n", (unsigned)available, (unsigned)chunk_size);
+            idle_ms += 10;
+            
+            // 定期打印等待状态
+            if (wait_count % 10 == 1) {
+                printf("[playback] Waiting: avail=%u/%u, mutex=%d, idle=%" PRIu32 "ms\n", 
+                    (unsigned)available, (unsigned)chunk_size,
+                    got_mutex, idle_ms);
             }
+            
+            // 超时检查（5秒）
             // 自动空闲超时退出（无数据>1500ms）
-            if (idle_ms > 8000) { // 进一步放宽至8s，容忍首包/弱网
+            if (idle_ms > 8000) { // 放宽至8s，容忍首包/弱网
                 printf("[playback] Idle timeout, no more data. Exiting playback.\n");
                 break;
             }
@@ -536,17 +714,36 @@ void playback_Task(void *arg) {
         idle_ms = 0;
         
         // 2. 读取一个chunk
-        if (xSemaphoreTake(g_playback_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            for (size_t i = 0; i < chunk_size; i++) {
-                chunk_buffer[i] = g_playback_buffer[g_playback_read_index];
-                g_playback_read_index = (g_playback_read_index + 1) % g_playback_buffer_size;
-            }
-            if (g_playback_data_size >= chunk_size) {
-                g_playback_data_size -= chunk_size;
-            } else {
-                g_playback_data_size = 0;
+        bool read_ok = false;
+        if (xSemaphoreTake(g_playback_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            // 再次检查数据量（可能在等待互斥量时发生变化）
+            size_t available = (g_playback_write_index >= g_playback_read_index) ? 
+                (g_playback_write_index - g_playback_read_index) : 
+                (g_playback_buffer_size - g_playback_read_index + g_playback_write_index);
+            if (available >= chunk_size) {
+                // 复制数据
+                for (size_t i = 0; i < chunk_size; i++) {
+                    chunk_buffer[i] = g_playback_buffer[g_playback_read_index];
+                    g_playback_read_index = (g_playback_read_index + 1) % g_playback_buffer_size;
+                }
+                read_ok = true;
+                
+                // 打印首块读取成功
+                if (chunks_played == 0) {
+                    size_t remaining = (g_playback_write_index >= g_playback_read_index) ? 
+                        (g_playback_write_index - g_playback_read_index) : 
+                        (g_playback_buffer_size - g_playback_read_index + g_playback_write_index);
+                    printf("[playback] First chunk read: %u bytes, remaining=%u\n", 
+                        (unsigned)chunk_size, (unsigned)remaining);
+                }
             }
             xSemaphoreGive(g_playback_mutex);
+        }
+        
+        if (!read_ok) {
+            ESP_LOGW(TAG, "读取播放数据失败");
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
         }
         
         // 3. 喂入参考信号到AEC
@@ -559,40 +756,61 @@ void playback_Task(void *arg) {
             xSemaphoreGive(g_reference_mutex);
         }
         
-        // 4. 播放到I2S（32-bit 槽：将16-bit样本左移16位做MSB对齐）
+        // 4. 播放到I2S
         if (g_i2s_tx_handle == NULL) {
-            printf("[playback] ❌ g_i2s_tx_handle is NULL! Skipping I2S write.\n");
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;  // 跳过一次循环，等待句柄初始化
+            ESP_LOGE(TAG, "❌ I2S句柄为空");
+            break;  // 严重错误，退出线程
         }
         
-        const size_t sample_count = chunk_size / 2; // 16-bit 样本数
-        int16_t *s16 = (int16_t *)chunk_buffer;
-        // 480 样本（chunk_size=960字节）
-        int32_t tx_buf[480];
-        for (size_t i = 0; i < sample_count && i < (sizeof(tx_buf)/sizeof(tx_buf[0])); i++) {
-            tx_buf[i] = ((int32_t)s16[i]) << 16; // MSB 对齐
+        // 从缓冲区读取数据
+        size_t bytes_read = 0;
+        
+        if (xSemaphoreTake(g_playback_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            size_t to_read = (available < chunk_size) ? available : chunk_size;
+            
+            // 读取数据
+            for (size_t i = 0; i < to_read; i++) {
+                chunk_buffer[i] = g_playback_buffer[g_playback_read_index];
+                g_playback_read_index = (g_playback_read_index + 1) % g_playback_buffer_size;
+            }
+            bytes_read = to_read;
+            
+            xSemaphoreGive(g_playback_mutex);
         }
-
+        
+        if (bytes_read == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        
+        // I2S写入
+        size_t bytes_to_write = bytes_read;
         size_t written = 0;
-        esp_err_t ret = i2s_channel_write(g_i2s_tx_handle, (const void *)tx_buf, sample_count * sizeof(int32_t), &written, portMAX_DELAY);
-        if (ret == ESP_OK) {
+        esp_err_t ret = i2s_channel_write(g_i2s_tx_handle, 
+            chunk_buffer, bytes_to_write,
+            &written, pdMS_TO_TICKS(100));
+            
+        if (ret == ESP_OK && written == bytes_to_write) {
             bytes_written += written;
             chunks_played++;
+            wait_count = 0;
+            idle_ms = 0;
             
+            // 首次播放成功日志
             if (chunks_played == 1) {
-                printf("[playback] ✅ First chunk played! I2S TX working!\n");
+                printf("[playback] ✅ First chunk played successfully!\n");
             }
             
-            if (chunks_played % 100 == 0) {
-                ESP_LOGI(TAG, "🔊 已播放 %lu 块 (%.1f秒)", chunks_played, (float)bytes_written / 32000.0f);
-                printf("[playback] 🔊 Played %lu chunks (%.1f sec)\n", chunks_played, (float)bytes_written / 32000.0f);
+            // 定期进度报告
+            if (chunks_played % 50 == 0) {
+                float seconds = (float)bytes_written / 32000.0f;
+                printf("[playback] Progress: %lu chunks, %.1fs\n", 
+                    chunks_played, seconds);
             }
         } else {
-            printf("[playback] ❌ I2S write failed: ret=%d, written=%u\n", ret, (unsigned)written);
-            ESP_LOGE(TAG, "❌ I2S写入失败: %d", ret);
-            // 写入失败，退出播放线程
-            break;
+            ESP_LOGE(TAG, "❌ I2S写入错误: %d, written=%u/%u", 
+                ret, (unsigned)written, (unsigned)bytes_to_write);
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
     
@@ -715,7 +933,6 @@ static mp_obj_t espsr_init(void) {
     g_playback_buffer_size = PLAYBACK_BUFFER_SIZE;
     g_playback_write_index = 0;
     g_playback_read_index = 0;
-    g_playback_data_size = 0;
     g_playback_running = false;
     g_playback_stop_requested = false;
     memset(g_playback_buffer, 0, PLAYBACK_BUFFER_SIZE);
@@ -816,7 +1033,8 @@ static mp_obj_t espsr_init(void) {
     // 启动任务
     task_flag = 1;
     xTaskCreatePinnedToCore(&feed_Task, "feed", 8 * 1024, (void*)afe_data, 5, NULL, 0);
-    xTaskCreatePinnedToCore(&detect_Task, "detect", 4 * 1024, (void*)afe_data, 5, NULL, 1);
+    // 增加任务栈大小到 8KB，并固定在核心 1 上运行
+    xTaskCreatePinnedToCore(&detect_Task, "detect", 8 * 1024, (void*)afe_data, 5, NULL, 1);
     
     espsr_initialized = true;
     ESP_LOGI(TAG, "ESP-SR initialized successfully");
@@ -1088,12 +1306,11 @@ static mp_obj_t espsr_start_playback(void) {
     
     // 创建播放线程
     g_playback_stop_requested = false;
-    g_playback_running = true;
     
     BaseType_t ret = xTaskCreatePinnedToCore(
         playback_Task,
         "playback",
-        8192,  // 增大栈空间，避免栈溢出
+        4096,  // 降低栈大小，减少创建失败的可能性
         NULL,
         5,
         &g_playback_task_handle,
@@ -1101,10 +1318,13 @@ static mp_obj_t espsr_start_playback(void) {
     );
     
     if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create playback task");
+        ESP_LOGE(TAG, "Failed to create playback task (ret=%d)", (int)ret);
         g_playback_running = false;
         return mp_const_false;
     }
+    
+    // 任务创建成功后再设置运行标志
+    g_playback_running = true;
     
     ESP_LOGI(TAG, "✅ 播放线程已启动");
     return mp_const_true;
@@ -1137,8 +1357,13 @@ static mp_obj_t espsr_feed_playback(mp_obj_t data_obj) {
         size_t before_write = g_playback_write_index;
         
         for (size_t i = 0; i < bufinfo.len; i++) {
+            // 计算当前缓冲区数据量
+            size_t data_size = (g_playback_write_index >= g_playback_read_index) ? 
+                (g_playback_write_index - g_playback_read_index) : 
+                (g_playback_buffer_size - g_playback_read_index + g_playback_write_index);
+            
             // 满则停止写入，返回已写字节数（不覆盖未读数据）
-            if (g_playback_data_size >= g_playback_buffer_size) {
+            if (data_size >= g_playback_buffer_size) {
                 ESP_LOGW(TAG, "⚠️ 播放缓冲区满，停止本次写入");
                 printf("[feed_playback] Buffer full! write_idx=%u, read_idx=%u\n", 
                        (unsigned)g_playback_write_index, (unsigned)g_playback_read_index);
@@ -1146,7 +1371,6 @@ static mp_obj_t espsr_feed_playback(mp_obj_t data_obj) {
             }
             g_playback_buffer[g_playback_write_index] = data[i];
             g_playback_write_index = (g_playback_write_index + 1) % g_playback_buffer_size;
-            g_playback_data_size++;
             written++;
         }
         
@@ -1155,9 +1379,12 @@ static mp_obj_t espsr_feed_playback(mp_obj_t data_obj) {
             printf("[feed_playback] ✅ First feed: %u bytes, write_idx: %u->%u\n", 
                    (unsigned)written, (unsigned)before_write, (unsigned)g_playback_write_index);
         } else if (feed_count % 10 == 0) {
+            size_t current_data_size = (g_playback_write_index >= g_playback_read_index) ? 
+                (g_playback_write_index - g_playback_read_index) : 
+                (g_playback_buffer_size - g_playback_read_index + g_playback_write_index);
             printf("[feed_playback] Feed #%lu: %u/%u bytes, buffer usage: %u/%u\n",
                    feed_count, (unsigned)written, (unsigned)bufinfo.len, 
-                   (unsigned)g_playback_data_size,
+                   (unsigned)current_data_size,
                    (unsigned)g_playback_buffer_size);
         }
         

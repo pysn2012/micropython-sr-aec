@@ -97,8 +97,8 @@ static volatile uint32_t g_ref_active_feeds = 0;     // 参考信号活跃的 fe
 #include "driver/i2s_pdm.h"
 
 #define TAG "espsr"
-#define PULSE_GPIO_NUM 4
-#define PULSE_DURATION_MS 500
+#define PULSE_GPIO_NUM 21
+#define PULSE_DURATION_MS 300
 
 // 自定义命令词表 (将"hai xiao le"作为首个唤醒命令)
 static const char *cmd_phoneme[21] = {
@@ -362,8 +362,8 @@ static void init_i2s(void) {
         .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(16000),
         .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
-            .clk = 4,
-            .din = 5,
+            .clk = GPIO_NUM_42,  // PDM CLK
+            .din = GPIO_NUM_41,  // PDM DATA
             .invert_flags = {
                 .clk_inv = false,
             },
@@ -391,9 +391,9 @@ static void init_i2s(void) {
         .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
-            .bclk = GPIO_NUM_15,
-            .ws = GPIO_NUM_16,
-            .dout = GPIO_NUM_7,
+            .bclk = GPIO_NUM_8,
+            .ws = GPIO_NUM_7,
+            .dout = GPIO_NUM_9,
             .din = I2S_GPIO_UNUSED,
             .invert_flags = {
                 .mclk_inv = false,

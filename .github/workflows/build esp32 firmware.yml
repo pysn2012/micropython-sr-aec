@@ -19,6 +19,7 @@ env:
   MICROPYTHON_DIR: ${{ github.workspace }}/micropython-sr-aec
   ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
   ESP_IDF_VERSION: v5.2.2
+  MPY_VERSION: sr-aec
 
 jobs:
   # ----------------------------------------------------------------
@@ -34,7 +35,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: micropython-sr-aec
-          submodules: recursive
+          submodules: false
 
       # 1.2 缓存 ESP-IDF + micropython-sr-aec + pip + 工具链
       - name: 缓存 ESP-IDF & micropython-sr-aec

@@ -19,7 +19,6 @@ env:
   MICROPYTHON_DIR: ${{ github.workspace }}/micropython-sr-aec
   ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
   ESP_IDF_VERSION: v5.2.2
-  MPY_VERSION: master
 
 jobs:
   # ----------------------------------------------------------------
@@ -34,7 +33,6 @@ jobs:
       - name: 检出 micropython-sr-aec
         uses: actions/checkout@v4
         with:
-          repository: micropython-sr-aec/micropython-sr-aec
           path: micropython-sr-aec
           submodules: recursive
 

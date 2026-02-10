@@ -30,15 +30,8 @@ jobs:
     outputs:
       cache-hit: ${{ steps.cache.outputs.cache-hit }}
     steps:
-      # 1.1 检出 micropython-sr-aec 主仓库（含子模块）
-      - name: 检出 micropython-sr-aec
-        uses: actions/checkout@v4
-        with:
-          path: micropython-sr-aec
-          submodules: false
-
-      # 1.2 缓存 ESP-IDF + micropython-sr-aec + pip + 工具链
-      - name: 缓存 ESP-IDF & micropython-sr-aec
+      # 1.2 缓存 ESP-IDF + pip + 工具链
+      - name: 缓存 ESP-IDF & 工具链 & pip
         id: cache
         uses: actions/cache@v4
         with:
@@ -46,11 +39,7 @@ jobs:
             ${{ env.ESP_IDF_DIR }}
             ~/.espressif/
             ~/.cache/pip/
-            ${{ env.MICROPYTHON_DIR }}
-          key: mpy-${{ env.MPY_VERSION }}-idf-${{ env.ESP_IDF_VERSION }}
-          restore-keys: |
-            mpy-${{ env.MPY_VERSION }}-idf-
-            mpy-
+          key: idf-${{ env.ESP_IDF_VERSION }}
 
       # 1.3 仅当缓存未命中时安装系统依赖
       - name: 安装系统依赖（未命中缓存时）
@@ -91,6 +80,13 @@ jobs:
             flash_size: 8
 
     steps:
+      # 1.1 检出 micropython-sr-aec 主仓库（含子模块）
+      - name: 检出 micropython-sr-aec
+        uses: actions/checkout@v4
+        with:
+          path: micropython-sr-aec
+
+    steps:
       # 2.1 恢复缓存
       - name: 恢复缓存
         uses: actions/cache@v4
@@ -99,8 +95,7 @@ jobs:
             ${{ env.ESP_IDF_DIR }}
             ~/.espressif/
             ~/.cache/pip/
-            ${{ env.MICROPYTHON_DIR }}
-          key: mpy-${{ env.MPY_VERSION }}-idf-${{ env.ESP_IDF_VERSION }}
+          key: idf-${{ env.ESP_IDF_VERSION }}
 
       # 2.2 编译固件（BOARD_VARIANT 为空时留空）
       - name: 编译固件

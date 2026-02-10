@@ -19,6 +19,12 @@
 #define VAD_PRE_SPEECH_MS 200       // 预留语音时间(ms)
 #define VAD_DEBOUNCE_FRAMES 6       // 连续帧数(30ms*6≈180ms)后才认为语音成立
 
+#define MPLOG(fmt, ...) \
+    mp_printf(&mp_plat_print, "[espsr] " fmt "\n", ##__VA_ARGS__)
+
+#define MPFAIL(msg) \
+    mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT(msg))
+
 // 音频配置结构体
 typedef struct {
     // 基本配置
@@ -824,8 +830,10 @@ void playback_Task(void *arg) {
 
 // MicroPython接口：初始化 (参照参考工程完整流程)
 static mp_obj_t espsr_init(void) {
-    if (espsr_initialized) {
-        return mp_const_true;
+    MPLOG("espsr_init() enter");
+	if (espsr_initialized) {
+        MPLOG("already initialized");
+		return mp_const_true;
     }
     
     ESP_LOGI(TAG, "Initializing ESP-SR with AEC...");
@@ -955,7 +963,13 @@ static mp_obj_t espsr_init(void) {
     ESP_LOGI(TAG, "VAD mutex created, initial state: SILENCE");
     
     // 初始化语音识别模型 (使用MR格式支持AEC)
-    srmodel_list_t *models = esp_srmodel_init("model");
+    MPLOG("loading SR models...");
+	srmodel_list_t *models = esp_srmodel_init("model");
+	if (!models) {
+        MPLOG("❌ esp_srmodel_init failed (model path?)");
+        MPFAIL("esp_srmodel_init failed");
+    }
+    MPLOG("SR models loaded");
     
     // 🔥 获取降噪模型（关键！）
     char *ns_model_name = esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL);
@@ -999,22 +1013,36 @@ static mp_obj_t espsr_init(void) {
     ESP_LOGI(TAG, "AFE config: format=MR, aec_init=true, aec_mode=%d, ns_init=%s, vad_init=true", 
         afe_config->aec_mode, ns_model_name ? "true" : "false");
     
+	MPLOG("creating AFE...");
     afe_handle = esp_afe_handle_from_config(afe_config);
+	if (!afe_handle) {
+        MPLOG("❌ esp_afe_handle_from_config failed");
+        MPFAIL("AFE handle create failed");
+    }
     afe_data = afe_handle->create_from_config(afe_config);
-    
+    if (!afe_data) {
+        MPLOG("❌ afe create_from_config failed");
+        MPFAIL("AFE data create failed");
+    }
+    MPLOG("AFE created");
+
     // 验证通道数
     int feed_channels = afe_handle->get_feed_channel_num(afe_data);
     ESP_LOGI(TAG, "AFE feed channels: %d (expected: 2 for MR)", feed_channels);
     
     // 初始化MultiNet
-    char *mn_name = esp_srmodel_filter(models, ESP_MN_CHINESE, NULL);
+    MPLOG("searching multinet model...");
+	char *mn_name = esp_srmodel_filter(models, ESP_MN_CHINESE, NULL);
     if (NULL == mn_name) {
-        printf("No multinet model found");
+        MPLOG("❌ no multinet model found");
+		MPFAIL("no multinet model");
+		printf("No multinet model found");
         return mp_const_false;
     }
     multinet = esp_mn_handle_from_name(mn_name);
     model_data = multinet->create(mn_name, 5760);  // 设置唤醒超时时间
-    printf("load multinet:%s\n", mn_name);
+    MPLOG("multinet model: %s", mn_name);
+	printf("load multinet:%s\n", mn_name);
     
     // 清除并添加命令词 (完全参照参考工程)
     esp_mn_commands_clear();
@@ -1029,7 +1057,11 @@ static mp_obj_t espsr_init(void) {
     
     // 创建结果队列 (增大到10，避免结果丢失)
     g_result_que = xQueueCreate(10, sizeof(sr_result_t));
-    
+    if (!g_result_que) {
+        MPLOG("❌ result queue create failed");
+        MPFAIL("queue create failed");
+    }
+	
     // 启动任务
     task_flag = 1;
     xTaskCreatePinnedToCore(&feed_Task, "feed", 8 * 1024, (void*)afe_data, 5, NULL, 0);
@@ -1318,7 +1350,9 @@ static mp_obj_t espsr_start_playback(void) {
     );
     
     if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create playback task (ret=%d)", (int)ret);
+        MPLOG("❌ feed task create failed");
+		MPFAIL("feed task create failed");
+		ESP_LOGE(TAG, "Failed to create playback task (ret=%d)", (int)ret);
         g_playback_running = false;
         return mp_const_false;
     }

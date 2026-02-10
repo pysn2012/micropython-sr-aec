@@ -86,7 +86,6 @@ jobs:
         with:
           path: micropython-sr-aec
 
-    steps:
       # 2.1 恢复缓存
       - name: 恢复缓存
         uses: actions/cache@v4

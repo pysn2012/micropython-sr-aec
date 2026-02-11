@@ -62,7 +62,7 @@ static audio_config_t g_audio_config = {
     .last_ref_energy = 0.0f,
     .ref_active_recent = false,
     .min_interrupt_energy = 5000.0f,
-    .vad_threshold = 0.02f;
+    .vad_threshold = 0.02f,
 
     // 时间控制相关
     .last_interrupt_time = 0,

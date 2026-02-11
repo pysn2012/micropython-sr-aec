@@ -206,7 +206,19 @@ static bool detect_voice_activity(int16_t *buffer, size_t samples) {
     // 应用阈值判断
     float energy_level = (float)energy / (samples * 32768.0f);
     bool current_frame_active = energy_level > g_audio_config.vad_threshold;
-    
+    // ===== VAD ENERGY DEBUG =====
+	static uint32_t vad_debug_count = 0;
+	vad_debug_count++;
+
+	if (vad_debug_count % 30 == 0) {  // 每约1秒打印一次
+		MPLOG("VAD DEBUG: energy=%" PRIu32 ", samples=%d, energy_level=%.6f, threshold=%.6f, speaking=%d",
+			  energy,
+			  (int)samples,
+			  energy_level,
+			  g_audio_config.vad_threshold,
+			  current_frame_active);
+	}
+	// ===== END DEBUG =====
     // 应用防抖逻辑
     if (current_frame_active) {
         vad_debounce_counter++;

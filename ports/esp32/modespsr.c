@@ -62,7 +62,7 @@ static audio_config_t g_audio_config = {
     .last_ref_energy = 0.0f,
     .ref_active_recent = false,
     .min_interrupt_energy = 5000.0f,
-    .vad_threshold = 5000.0f,
+    .vad_threshold = 0.02f;
 
     // 时间控制相关
     .last_interrupt_time = 0,
@@ -445,7 +445,23 @@ void feed_Task(void *arg) {
         // 从PDM麦克风读取数据
         esp_err_t result = i2s_channel_read(rx_handle, mic_data, 
             feed_chunksize * sizeof(int16_t), &bytesIn, portMAX_DELAY);
-        
+        // ===== MIC DEBUG START =====
+		static uint32_t mic_dbg_cnt = 0;
+		int16_t mic_max = 0;
+		int16_t mic_min = 0;
+
+		for (int i = 0; i < feed_chunksize; i++) {
+			int16_t v = mic_data[i];
+			if (v > mic_max) mic_max = v;
+			if (v < mic_min) mic_min = v;
+		}
+
+		mic_dbg_cnt++;
+		if (mic_dbg_cnt % 50 == 0) {
+			MPLOG("MIC_RAW max=%d min=%d bytes=%d",
+				  mic_max, mic_min, (int)bytesIn);
+		}
+		// ===== MIC DEBUG END =====
         if (result == ESP_OK && bytesIn > 0) {
             g_feed_count++;  // 统计 feed 次数
             
@@ -1109,7 +1125,7 @@ static mp_obj_t espsr_listen(mp_obj_t timeout_obj) {
         }
     }
     
-    return mp_obj_new_str("timeout", 7);
+    return mp_obj_new_str("none", 7);
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(espsr_listen_obj, espsr_listen);
 
